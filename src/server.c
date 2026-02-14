@@ -866,6 +866,14 @@ dictType sdsHashDictType = {
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 
+/* Dict for binary-safe sds keys with heap values freed via zfree(). */
+dictType sdsKeyHeapPointerValueDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
+};
+
 size_t clientHashtableTypeMetadataSize(void) {
     return sizeof(void *);
 }
@@ -2514,10 +2522,23 @@ void initServerConfig(void) {
     appendServerSaveParams(60, 10000);  /* save after 1 minute and 10000 changes */
 
     /* Replication related */
+    server.active_replica = 0;
+    server.multi_master = 0;
+    server.multi_master_no_forward = 0;
+    server.rreplay_seen = NULL;
+    server.rreplay_seen_order = NULL;
+    server.rreplay_seq = 0;
+    server.hlc_key_clock = NULL;
+    server.hlc_key_tie_break = NULL;
+    server.hlc_clock.wall_time = 0;
+    server.hlc_clock.logical = 0;
+    server.hlc_rdb_clock_entries_dropped_last_save = 0;
     server.primary_host = NULL;
     server.primary_port = 6379;
     server.primary = NULL;
     server.cached_primary = NULL;
+    server.upstreams = NULL;
+    server.upstream_runtime = NULL;
     server.primary_initial_offset = -1;
     server.repl_state = REPL_STATE_NONE;
     server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
@@ -3104,6 +3125,12 @@ void initServer(void) {
     server.clients_to_close = listCreate();
     server.replicas = listCreate();
     server.monitors = listCreate();
+    server.upstreams = listCreate();
+    server.upstream_runtime = listCreate();
+    server.rreplay_seen = dictCreate(&sdsHashDictType);
+    server.rreplay_seen_order = listCreate();
+    server.hlc_key_clock = dictCreate(&sdsKeyHeapPointerValueDictType);
+    server.hlc_key_tie_break = dictCreate(&sdsKeyHeapPointerValueDictType);
     server.replicas_waiting_psync = raxNew();
     server.wait_before_rdb_client_free = DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE;
     server.clients_pending_write = listCreate();
@@ -3796,8 +3823,26 @@ bool clientSupportStandAloneRedirect(client *c) {
     return !server.cluster_enabled && server.primary_host && c->capa & CLIENT_CAPA_REDIRECT;
 }
 
+static int shouldForwardToPrimaryViaRReplay(int target) {
+    if (!(target & PROPAGATE_REPL)) return 0;
+    if (!server.active_replica || !server.multi_master) return 0;
+    int has_primary = (server.primary_host != NULL && server.primary != NULL && server.repl_state == REPL_STATE_CONNECTED);
+    int has_upstreams = (server.upstream_runtime && listLength(server.upstream_runtime) > 0);
+    if (!has_primary && !has_upstreams) return 0;
+    if (server.loading) return 0;
+    if (server.current_client == NULL) return 0;
+    /* Never re-wrap traffic that already arrived on replication links. In MM
+     * peer-forward mode, RREPLAY frames come from replica links (rreplay-peer),
+     * not only from the primary link. */
+    if (server.current_client->flag.primary || server.current_client->flag.replica) return 0;
+    if (server.current_client->slot_migration_job) return 0;
+    return 1;
+}
+
 static int shouldPropagate(int target) {
-    if (!server.replication_allowed || target == PROPAGATE_NONE || server.loading) return 0;
+    if (!server.replication_allowed || target == PROPAGATE_NONE) return 0;
+    if (shouldForwardToPrimaryViaRReplay(target)) return 1;
+    if (server.loading) return 0;
 
     if (target & PROPAGATE_AOF) {
         if (server.aof_state != AOF_OFF) return 1;
@@ -3859,13 +3904,19 @@ static void propagateNow(int dbid, robj **argv, int argc, int target, int slot) 
      * when we have replicas. */
     int propagate_to_repl = target & PROPAGATE_REPL;
     if (propagate_to_repl && !propagate_to_aof) {
-        propagate_to_repl = server.primary_host == NULL && (server.repl_backlog || listLength(server.replicas) != 0);
+        if (server.active_replica && server.multi_master) {
+            propagate_to_repl = (server.repl_backlog || listLength(server.replicas) != 0);
+        } else {
+            propagate_to_repl = server.primary_host == NULL && (server.repl_backlog || listLength(server.replicas) != 0);
+        }
     }
     int propagate_to_slot_migration = target & PROPAGATE_REPL && clusterIsAnySlotExporting();
+    int propagate_to_primary = shouldForwardToPrimaryViaRReplay(target);
 
     if (propagate_to_aof) feedAppendOnlyFile(dbid, argv, argc);
     if (propagate_to_repl) replicationFeedReplicas(dbid, argv, argc);
     if (propagate_to_slot_migration) clusterFeedSlotExportJobs(dbid, argv, argc, slot);
+    if (propagate_to_primary) replicationFeedPrimaryWithRReplay(dbid, argv, argc);
 }
 
 /* BgIteration requires that replication is sent after each command, however the
@@ -7025,6 +7076,171 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         }
 
         info = sdscatprintf(info, "connected_slaves:%lu\r\n", listLength(server.replicas));
+        int connected_masters = 0;
+        if (server.upstream_runtime && listLength(server.upstream_runtime) > 0) {
+            listIter rtli;
+            listNode *rtln;
+            listRewind(server.upstream_runtime, &rtli);
+            while ((rtln = listNext(&rtli)) != NULL) {
+                valkeyUpstreamRuntime *rt = listNodeValue(rtln);
+                if (rt && rt->active_link && rt->repl_state == REPL_STATE_CONNECTED) connected_masters++;
+            }
+        } else {
+            connected_masters = (server.primary_host && server.repl_state == REPL_STATE_CONNECTED) ? 1 : 0;
+        }
+        const char *master_global_link_status = "down";
+        if ((server.upstreams == NULL || listLength(server.upstreams) == 0) && server.primary_host == NULL) {
+            master_global_link_status = "none";
+        } else if (connected_masters > 0) {
+            master_global_link_status = "up";
+        }
+
+        unsigned long active_upstream_runtime_links = 0;
+        unsigned long long upstream_runtime_replay_tx_frames = 0;
+        unsigned long long upstream_runtime_replay_rx_frames = 0;
+        unsigned long long upstream_runtime_replay_ack_frames = 0;
+        unsigned long long upstream_runtime_replay_backlog_total = 0;
+        unsigned long long upstream_runtime_replay_pending_frames = 0;
+        unsigned long long upstream_runtime_replay_pending_dropped = 0;
+        unsigned long long upstream_runtime_replay_fullsync_requests = 0;
+        if (server.upstream_runtime) {
+            listIter rtli;
+            listNode *rtln;
+            listRewind(server.upstream_runtime, &rtli);
+            while ((rtln = listNext(&rtli)) != NULL) {
+                valkeyUpstreamRuntime *rt = listNodeValue(rtln);
+                if (rt == NULL) continue;
+                if (rt->active_link) active_upstream_runtime_links++;
+                upstream_runtime_replay_tx_frames += rt->replay_tx_frames;
+                upstream_runtime_replay_rx_frames += rt->replay_rx_frames;
+                upstream_runtime_replay_ack_frames += rt->replay_ack_frames;
+                if (rt->replay_last_sent_id > rt->replay_last_acked_id) {
+                    upstream_runtime_replay_backlog_total += (rt->replay_last_sent_id - rt->replay_last_acked_id);
+                }
+                if (rt->replay_pending_frames) {
+                    upstream_runtime_replay_pending_frames += listLength(rt->replay_pending_frames);
+                }
+                upstream_runtime_replay_pending_dropped += rt->replay_pending_dropped;
+                upstream_runtime_replay_fullsync_requests += rt->replay_fullsync_requests;
+            }
+        }
+
+        info = sdscatprintf(
+            info,
+            FMTARGS(
+                "active_replica:%d\r\n", server.active_replica,
+                "multi_master:%d\r\n", server.multi_master,
+                "multi_master_no_forward:%d\r\n", server.multi_master_no_forward,
+                "master_global_link_status:%s\r\n", master_global_link_status,
+                "connected_masters:%d\r\n", connected_masters,
+                "configured_upstreams:%lu\r\n", server.upstreams ? listLength(server.upstreams) : 0,
+                "upstream_runtime_entries:%lu\r\n", server.upstream_runtime ? listLength(server.upstream_runtime) : 0,
+                "active_upstream_runtime_links:%lu\r\n", active_upstream_runtime_links,
+                "upstream_runtime_replay_tx_frames:%llu\r\n", upstream_runtime_replay_tx_frames,
+                "upstream_runtime_replay_rx_frames:%llu\r\n", upstream_runtime_replay_rx_frames,
+                "upstream_runtime_replay_ack_frames:%llu\r\n", upstream_runtime_replay_ack_frames,
+                "upstream_runtime_replay_backlog:%llu\r\n", upstream_runtime_replay_backlog_total,
+                "upstream_runtime_replay_pending_frames:%llu\r\n", upstream_runtime_replay_pending_frames,
+                "upstream_runtime_replay_pending_dropped:%llu\r\n", upstream_runtime_replay_pending_dropped,
+                "upstream_runtime_replay_fullsync_requests:%llu\r\n", upstream_runtime_replay_fullsync_requests,
+                "hlc_clock_wall:%llu\r\n", (unsigned long long)server.hlc_clock.wall_time,
+                "hlc_clock_logical:%llu\r\n", (unsigned long long)server.hlc_clock.logical,
+                "hlc_key_clock_entries:%zu\r\n", server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0,
+                "hlc_key_tie_break_entries:%zu\r\n", server.hlc_key_tie_break ? dictSize(server.hlc_key_tie_break) : 0,
+                "hlc_rdb_clock_max_entries:%lld\r\n", server.hlc_rdb_clock_max_entries,
+                "hlc_rdb_clock_entries_dropped_last_save:%llu\r\n", server.hlc_rdb_clock_entries_dropped_last_save,
+                "rreplay_dedupe_entries:%zu\r\n", server.rreplay_seen ? dictSize(server.rreplay_seen) : 0));
+
+        list *info_upstreams =
+            (server.upstream_runtime && listLength(server.upstream_runtime) > 0) ? server.upstream_runtime : server.upstreams;
+        if (info_upstreams && listLength(info_upstreams)) {
+            listIter upstream_li;
+            listNode *upstream_ln;
+            unsigned long upstream_id = 0;
+
+            listRewind(info_upstreams, &upstream_li);
+            while ((upstream_ln = listNext(&upstream_li)) != NULL) {
+                const char *host = "?";
+                int port = 0;
+                int is_current = 0;
+                const char *upstream_state = "disconnected";
+                long long upstream_offset = -1;
+                int upstream_last_io = -1;
+                unsigned long long replay_last_sent_id = 0;
+                unsigned long long replay_last_acked_id = 0;
+                unsigned long long replay_tx_frames = 0;
+                unsigned long long replay_rx_frames = 0;
+                unsigned long long replay_ack_frames = 0;
+                unsigned long long replay_backlog = 0;
+                unsigned long long replay_pending_frames = 0;
+                unsigned long long replay_pending_dropped = 0;
+                unsigned long long replay_fullsync_requests = 0;
+                int replay_fullsync_required = 0;
+                if (info_upstreams == server.upstream_runtime) {
+                    valkeyUpstreamRuntime *runtime = listNodeValue(upstream_ln);
+                    if (runtime && runtime->host) {
+                        host = runtime->host;
+                        port = runtime->port;
+                        is_current = runtime->active_link;
+                        if (runtime->repl_state == REPL_STATE_CONNECTED)
+                            upstream_state = "up";
+                        else if (runtime->repl_state != REPL_STATE_NONE)
+                            upstream_state = "down";
+                        if (runtime->reploff >= 0) upstream_offset = runtime->reploff;
+                        if (runtime->last_io_sec >= 0) upstream_last_io = (int)runtime->last_io_sec;
+                        replay_last_sent_id = runtime->replay_last_sent_id;
+                        replay_last_acked_id = runtime->replay_last_acked_id;
+                        replay_tx_frames = runtime->replay_tx_frames;
+                        replay_rx_frames = runtime->replay_rx_frames;
+                        replay_ack_frames = runtime->replay_ack_frames;
+                        replay_pending_frames = runtime->replay_pending_frames ? listLength(runtime->replay_pending_frames) : 0;
+                        replay_pending_dropped = runtime->replay_pending_dropped;
+                        replay_fullsync_requests = runtime->replay_fullsync_requests;
+                        replay_fullsync_required = runtime->replay_fullsync_required;
+                        if (replay_last_sent_id > replay_last_acked_id) {
+                            replay_backlog = replay_last_sent_id - replay_last_acked_id;
+                        }
+                    }
+                } else {
+                    valkeyUpstream *upstream = listNodeValue(upstream_ln);
+                    if (upstream && upstream->host) {
+                        host = upstream->host;
+                        port = upstream->port;
+                        is_current = server.primary_host && !strcasecmp(server.primary_host, upstream->host) &&
+                                     server.primary_port == upstream->port;
+                    }
+                }
+                if (is_current && upstream_last_io < 0) {
+                    upstream_state = (server.repl_state == REPL_STATE_CONNECTED) ? "up" : "down";
+                    if (server.primary) {
+                        upstream_offset = server.primary->repl_data->reploff;
+                        upstream_last_io = (int)(server.unixtime - server.primary->last_interaction);
+                    } else if (server.cached_primary) {
+                        upstream_offset = server.cached_primary->repl_data->reploff;
+                    }
+                    if (upstream_last_io < 0 && server.repl_transfer_lastio > 0) {
+                        upstream_last_io = (int)(server.unixtime - server.repl_transfer_lastio);
+                    }
+                }
+                info = sdscatprintf(info,
+                                    "upstream%lu:host=%s,port=%d,state=%s,active=%d,offset=%lld,last_io_seconds_ago=%d,replay_last_sent=%llu,replay_last_acked=%llu,replay_backlog=%llu,replay_tx_frames=%llu,replay_rx_frames=%llu,replay_ack_frames=%llu,replay_pending_frames=%llu,replay_pending_dropped=%llu,replay_fullsync_requests=%llu,replay_fullsync_required=%d\r\n",
+                                    upstream_id, host, port, upstream_state, is_current ? 1 : 0, upstream_offset,
+                                    upstream_last_io,
+                                    replay_last_sent_id, replay_last_acked_id, replay_backlog,
+                                    replay_tx_frames, replay_rx_frames, replay_ack_frames,
+                                    replay_pending_frames, replay_pending_dropped,
+                                    replay_fullsync_requests, replay_fullsync_required);
+                info = sdscatprintf(info,
+                                    "master_%lu:host=%s,port=%d,state=%s,active=%d,offset=%lld,last_io_seconds_ago=%d,replay_last_sent=%llu,replay_last_acked=%llu,replay_backlog=%llu,replay_tx_frames=%llu,replay_rx_frames=%llu,replay_ack_frames=%llu,replay_pending_frames=%llu,replay_pending_dropped=%llu,replay_fullsync_requests=%llu,replay_fullsync_required=%d\r\n",
+                                    upstream_id, host, port, upstream_state, is_current ? 1 : 0, upstream_offset,
+                                    upstream_last_io,
+                                    replay_last_sent_id, replay_last_acked_id, replay_backlog,
+                                    replay_tx_frames, replay_rx_frames, replay_ack_frames,
+                                    replay_pending_frames, replay_pending_dropped,
+                                    replay_fullsync_requests, replay_fullsync_required);
+                upstream_id++;
+            }
+        }
 
         /* If min-replicas-to-write is active, write the number of replicas
          * currently considered 'good'. */
@@ -7049,17 +7265,19 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                     replica_ip = ip;
                 }
                 const char *state = replstateToString(replica->repl_data->repl_state);
+                const char *replica_uuid = replica->repl_data->replica_uuid ? replica->repl_data->replica_uuid : "-";
                 if (state[0] == '\0') continue;
                 if (replica->repl_data->repl_state == REPLICA_STATE_ONLINE) lag = time(NULL) - replica->repl_data->repl_ack_time;
 
                 info = sdscatprintf(info,
                                     "slave%d:ip=%s,port=%d,state=%s,"
-                                    "offset=%lld,lag=%ld,type=%s",
+                                    "offset=%lld,lag=%ld,type=%s,uuid=%s",
                                     replica_id, replica_ip, replica->repl_data->replica_listening_port, state,
                                     replica->repl_data->repl_ack_off, lag,
                                     replica->flag.repl_rdb_channel                                ? "rdb-channel"
                                     : replica->repl_data->repl_state == REPLICA_STATE_BG_RDB_LOAD ? "main-channel"
-                                                                                                  : "replica");
+                                                                                                  : "replica",
+                                    replica_uuid);
                 if (replica->repl_data->repl_compression) {
                     info = sdscatprintf(info,
                                         ",repl_compression=%s"
@@ -7676,8 +7894,8 @@ void dismissMemoryInChild(void) {
     /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
     if (server.thp_enabled) return;
 
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
+    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
+     * so we avoid these pointless loops when they're not going to do anything. */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     listIter li;
     listNode *ln;
@@ -7738,6 +7956,12 @@ void loadDataFromDisk(void) {
         if (rdb_load_ret == RDB_OK) {
             serverLog(LL_NOTICE, "DB loaded from disk: %.3f seconds", (float)(ustime() - start) / 1000000);
 
+            /* Restore multi-master upstream metadata persisted in AUX fields. */
+            replicationApplyRdbConfiguredUpstreams(&rsi);
+            replicationApplyRdbUpstreamRuntimeState(&rsi);
+            replicationApplyRdbHLCState(&rsi);
+            replicationApplyRdbRReplaySeen(&rsi);
+
             /* Restore the replication ID / offset from the RDB file. */
             if (rsi.repl_id_is_set && rsi.repl_offset != -1 &&
                 /* Note that older implementations may save a repl_stream_db
@@ -7778,6 +8002,7 @@ void loadDataFromDisk(void) {
          * possible to support partial resynchronization, to avoid extra memory
          * of replication backlog, we drop it. */
         if (!rsi_is_valid && server.repl_backlog) freeReplicationBacklog();
+        rdbFreeSaveInfo(&rsi);
     }
 }
 

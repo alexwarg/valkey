@@ -6,12 +6,7 @@
         "since": "5.0.0",
         "arity": 3,
         "function": "replicaofCommand",
-        "command_flags": [
-            "NO_ASYNC_LOADING",
-            "ADMIN",
-            "NOSCRIPT",
-            "STALE"
-        ],
+        "command_flags": ["NO_ASYNC_LOADING", "ADMIN", "NOSCRIPT", "STALE"],
         "arguments": [
             {
                 "name": "args",
@@ -55,10 +50,6 @@
             "type": "string",
             "pattern": "OK*"
         },
-        "acl_categories": [
-            "ADMIN",
-            "DANGEROUS",
-            "SLOW"
-        ]
+        "acl_categories": ["ADMIN", "DANGEROUS", "SLOW"]
     }
 }

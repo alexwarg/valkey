@@ -287,6 +287,7 @@ int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi);
 ssize_t rdbSaveAuxFieldStrStr(rio *rdb, char *key, char *val);
 ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
+void rdbFreeSaveInfo(rdbSaveInfo *rsi);
 void replicationEmptyDbCallback(hashtable *ht);
 ssize_t rdbSaveDbSizeHints(rio *rdb, serverDb *db, int include_importing);
 int rdbWriteHeader(rio *rdb, int req, int rdbver, int rdbflags, rdbSaveInfo *rsi);

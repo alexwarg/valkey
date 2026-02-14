@@ -166,6 +166,9 @@ struct ValkeyModule;
 #define CONFIG_RUN_ID_SIZE 40
 #define RDB_EOF_MARK_SIZE 40
 #define CONFIG_REPL_BACKLOG_MIN_SIZE (1024 * 16) /* 16k */
+#define CONFIG_DEFAULT_HLC_RDB_CLOCK_MAX_ENTRIES 200000
+#define CONFIG_DEFAULT_RREPLAY_PENDING_MAX_ENTRIES 50000
+#define CONFIG_DEFAULT_HLC_MAX_CLOCK_DRIFT_USEC 500000 /* Default HLC drift tolerance: 500 ms in microseconds. https://cse.buffalo.edu/tech-reports/2014-04.pdf  */
 #define CONFIG_BGSAVE_RETRY_DELAY 5              /* Wait a few secs before trying again. */
 #define CONFIG_DEFAULT_PID_FILE "/var/run/valkey.pid"
 #define CONFIG_DEFAULT_BINDADDR_COUNT 2
@@ -414,6 +417,7 @@ typedef enum {
     REPL_STATE_RECEIVE_IP_REPLY,      /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_CAPA_REPLY,    /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_VERSION_REPLY, /* Wait for REPLCONF reply */
+    REPL_STATE_RECEIVE_UUID_REPLY,    /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_NODEID_REPLY,  /* Wait for REPLCONF reply */
     REPL_STATE_SEND_PSYNC,            /* Send PSYNC */
     REPL_STATE_RECEIVE_PSYNC_REPLY,   /* Wait for PSYNC reply */
@@ -471,6 +475,7 @@ typedef enum {
 #define REPLICA_CAPA_LZ4 (1 << 4)               /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD (1 << 5)              /* Accepts Zstd streaming-compressed replication payloads. */
 #define REPLICA_CAPA_INBAND_REPL (1 << 6)       /* Supports RDB_OPCODE_UPDATE for inline replication. */
+#define REPLICA_CAPA_RREPLAY_PEER (1 << 7)      /* Internal peer link for multi-master RREPLAY forwarding. */
 #define REPLICA_CAPA_COMPRESSION_MASK (REPLICA_CAPA_LZ4 | REPLICA_CAPA_ZSTD)
 
 /* Replica capability strings */
@@ -478,6 +483,7 @@ typedef enum {
 #define REPLICA_CAPA_LZ4_STR "lz4"                             /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD_STR "zstd"                           /* Accepts Zstd streaming-compressed replication payloads. */
 #define REPLICA_CAPA_INBAND_REPL_STR "inband-repl"             /* Supports RDB_OPCODE_UPDATE for inline replication. */
+#define REPLICA_CAPA_RREPLAY_PEER_STR "rreplay-peer"
 
 /* Replica requirements */
 #define REPLICA_REQ_NONE 0
@@ -1259,6 +1265,7 @@ typedef struct ClientFlags {
     uint64_t module_prevent_repl_prop : 1; /* Module client do not want to propagate to replica */
     uint64_t reexecuting_command : 1;      /* The client is re-executing the command. */
     uint64_t replication_done : 1;         /* Indicate that replication has been done on the client */
+    uint64_t skip_repl_stream_propagation : 1; /* Skip one propagation from primary stream to downstream replicas. */
     uint64_t authenticated : 1;            /* Indicate a client has successfully authenticated */
     uint64_t ever_authenticated : 1;       /* Indicate a client was ever successfully authenticated during it's lifetime */
     uint64_t protected_rdb_channel : 1;    /* Dual channel replication sync: Protects the RDB client from premature \
@@ -1353,6 +1360,7 @@ typedef struct ClientReplicationData {
     char replid[CONFIG_RUN_ID_SIZE + 1]; /* primary replication ID (if primary). */
     int replica_listening_port;          /* As configured with: REPLCONF listening-port */
     char *replica_addr;                  /* Optionally given by REPLCONF ip-address */
+    sds replica_uuid;                    /* Optionally given by REPLCONF uuid */
     int replica_version;                 /* Version on the form 0xMMmmpp. */
     short replica_capa;                  /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
     _Atomic(int) forkless_pending_close; /* Main thread asks the forkless save to hand this replica
@@ -1733,6 +1741,66 @@ typedef enum {
     PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS
 } replicationErrorBehavior;
 
+/* Hybrid Logical Clock (HLC) representation */
+typedef struct {
+    uint64_t wall_time;
+    uint64_t logical;
+} hlc;
+
+/* Compare two hybrid logical clocks. Returns:
+ * 1 if a > b,
+ * -1 if a < b,
+ * 0 if a == b 
+ *
+ * This first checks wall_time
+ * and falls back to logical to break ties.
+ */
+static inline int hlcCompare(const hlc *a, const hlc *b) {
+    if (a->wall_time > b->wall_time) return 1;
+    if (a->wall_time < b->wall_time) return -1;
+    if (a->logical > b->logical) return 1;
+    if (a->logical < b->logical) return -1;
+    return 0;
+}
+
+/* A configured upstream endpoint. For now this is a scaffold that mirrors
+ * the legacy single primary configuration. */
+typedef struct valkeyUpstream {
+    sds host;
+    int port;
+} valkeyUpstream;
+
+typedef struct rreplayPendingFrame {
+    unsigned long long replay_id;
+    sds frame;
+    int sent_once; /* 1 if the frame was sent on the current connection and is awaiting ACK. */
+} rreplayPendingFrame;
+
+/* Runtime state holder for configured upstreams. */
+typedef struct valkeyUpstreamRuntime {
+    sds host;
+    int port;
+    client *link_client;  /* Forwarding connection client for this upstream, when available. */
+    client *incoming_client; /* Receiving connection client for this upstream. */
+    connection *forward_conn; /* Pending outbound forwarding connection, when connecting. */
+    sds replybuf;         /* Small parser buffer for peer-forwarding command replies. */
+    int active_link;       /* 1 when this upstream is currently active at runtime. */
+    int repl_state;        /* Last known replication state for this upstream link. */
+    long long reploff;     /* Last known replication offset for this upstream link. */
+    long long last_io_sec; /* Last known I/O timestamp in unix seconds. */
+    long long last_connect_attempt_sec; /* Last outbound connect attempt timestamp. */
+    unsigned long long replay_last_sent_id;  /* Last replay-id sent to this peer. */
+    unsigned long long replay_last_acked_id; /* Last replay-id acked by this peer. */
+    unsigned long long replay_last_received_id; /* Last replay-id received from this peer. */
+    unsigned long long replay_tx_frames;     /* Total replay frames sent to this peer. */
+    unsigned long long replay_rx_frames;     /* Total replay frames received from this peer. */
+    unsigned long long replay_ack_frames;    /* Total replay ACK replies received from this peer. */
+    unsigned long long replay_pending_dropped; /* Total pending replay frames dropped by queue cap. */
+    unsigned long long replay_fullsync_requests; /* Total peer full-sync requests sent after queue overflow. */
+    int replay_fullsync_required; /* 1 when queue overflow requires peer full-sync before incremental replay. */
+    list *replay_pending_frames; /* Pending outbound replay frames awaiting ACK on peer-forward links. */
+} valkeyUpstreamRuntime;
+
 /* This structure can be optionally passed to RDB save/load functions in
  * order to implement additional functionalities, by storing and loading
  * metadata to the RDB file.
@@ -1749,9 +1817,19 @@ typedef struct rdbSaveInfo {
     int repl_id_is_set;                   /* True if repl_id field is set. */
     char repl_id[CONFIG_RUN_ID_SIZE + 1]; /* Replication ID. */
     long long repl_offset;                /* Replication offset. */
+    int repl_masters_count;               /* Number of configured upstreams persisted in RDB AUX. */
+    sds *repl_masters;                    /* Upstreams encoded as "<host>|<port>". */
+    int repl_runtime_count;               /* Number of upstream runtime entries persisted in RDB AUX. */
+    sds *repl_runtime_entries;            /* Runtime entries encoded as "<host>|<port>|<sent>|<acked>|<tx>|<rx>|<ack>". */
+    int repl_runtime_pending_count;       /* Number of pending replay queue entries persisted in RDB AUX. */
+    sds *repl_runtime_pending_entries;    /* Pending entries encoded as "<runtime-idx:u64><replay-id:u64><resp-frame-bytes...>". */
+    int rreplay_seen_count;               /* Number of persisted dedupe keys from RREPLAY. */
+    sds *rreplay_seen_entries;            /* Dedupe keys encoded as "<origin-uuid>:<replay-id>". */
+    hlc hlc_clock;                        /* Global HLC logical clock persisted in RDB AUX. */
+    dict *hlc_key_clock;                  /* Encoded key clock map loaded from RDB AUX. */
 } rdbSaveInfo;
 
-#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1}
+#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1, 0, NULL, 0, NULL, 0, NULL, 0, NULL, {0, 0}, NULL}
 
 struct malloc_stats {
     size_t zmalloc_used;
@@ -1945,6 +2023,8 @@ struct valkeyServer {
     list *clients_to_close;                /* Clients to close asynchronously */
     list *clients_pending_write;           /* There is to write or install handler. */
     list *replicas, *monitors;             /* List of replicas and MONITORs */
+    list *upstreams;                       /* Configured upstream endpoints (multi-master scaffold). */
+    list *upstream_runtime;                /* Runtime state per configured upstream (Phase 7 scaffold). */
     rax *replicas_waiting_psync;           /* Radix tree for tracking replicas awaiting partial synchronization.
                                             * Key: RDB client ID
                                             * Value: RDB client object
@@ -2306,6 +2386,19 @@ struct valkeyServer {
     list *repl_buffer_blocks;                   /* Replication buffers blocks list
                                                  * (serving replica clients and repl backlog) */
     /* Replication (replica) */
+    int active_replica;   /* If enabled, this node may accept writes while being a replica. */
+    int multi_master;     /* If enabled, allow multiple configured upstreams (scaffold). */
+    int multi_master_no_forward; /* If enabled, avoid forwarding replay traffic (scaffold). */
+    dict *rreplay_seen;   /* Recent replay frames for dedupe. Key: "<origin-uuid>:<replay-id>" */
+    list *rreplay_seen_order; /* FIFO order for replay dedupe eviction. Values are sds keys in rreplay_seen. */
+    unsigned long long rreplay_seq; /* Local replay sequence generator used for outbound RREPLAY. */
+    long long rreplay_pending_max_entries; /* Per-upstream pending replay frame queue cap. */
+    dict *hlc_key_clock; /* Key-level LWW clock map. Key: binary(dbid)+key-bytes, Value: hlc*. */
+    dict *hlc_key_tie_break; /* Deterministic tie-break map. Key: binary(dbid)+key-bytes, Value: zstrdup("<uuid>:<id>"). */
+    hlc hlc_clock;  /* Hybrid logical clock */
+    long long hlc_rdb_clock_max_entries; /* Configurable cap for persisted HLC key clocks in RDB AUX. */
+    unsigned long long hlc_rdb_clock_entries_dropped_last_save; /* Last RDB save: valid HLC entries omitted by cap. */
+    long long hlc_max_clock_drift; /* Max tolerated microseconds between HLC wall time and physical time (0 = disabled). */
     char *primary_user;     /* AUTH with this user and primary_auth with primary */
     sds primary_auth;       /* AUTH with this password with primary */
     char *primary_host;     /* Hostname of primary */
@@ -3045,6 +3138,7 @@ extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
 extern dictType objectKeyHeapPointerValueDictType;
+extern dictType sdsKeyHeapPointerValueDictType;
 extern hashtableType setHashtableType;
 extern hashtableType zsetHashtableType;
 extern hashtableType kvstoreKeysHashtableType;
@@ -3451,8 +3545,10 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 /* Replication */
 int prepareReplicasToWrite(void);
 void replicationFeedReplicas(int dictid, robj **argv, int argc);
+void replicationFeedPrimaryWithRReplay(int dictid, robj **argv, int argc);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
+void replicationDetachUpstreamRuntimeClient(client *c);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
@@ -3465,6 +3561,12 @@ void replicationCachePrimary(client *c);
 void resizeReplicationBacklog(void);
 void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disconnect_blocked);
 void replicationUnsetPrimary(void);
+void replicationApplyRdbConfiguredUpstreams(const rdbSaveInfo *rsi);
+void replicationApplyRdbUpstreamRuntimeState(const rdbSaveInfo *rsi);
+void replicationApplyRdbRReplaySeen(const rdbSaveInfo *rsi);
+void replicationApplyRdbHLCState(const rdbSaveInfo *rsi);
+hlc replicationHLCGetKeyClock(int dbid, robj *key);
+void replicationHLCSetKeyClock(int dbid, robj *key, hlc ts);
 void refreshGoodReplicasCount(void);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
@@ -4351,6 +4453,7 @@ void expiretimeCommand(client *c);
 void pexpiretimeCommand(client *c);
 void persistCommand(client *c);
 void replicaofCommand(client *c);
+void multimasterCommand(client *c);
 void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);
@@ -4450,6 +4553,7 @@ void clusterKeySlotCommand(client *c);
 void clusterSlotStatsCommand(client *c);
 void clusterscanCommand(client *c);
 void restoreCommand(client *c);
+void hlcrestoreCommand(client *c);
 void migrateCommand(client *c);
 void askingCommand(client *c);
 void readonlyCommand(client *c);
@@ -4501,6 +4605,7 @@ void bitopCommand(client *c);
 void bitcountCommand(client *c);
 void bitposCommand(client *c);
 void replconfCommand(client *c);
+void rreplayCommand(client *c);
 void waitCommand(client *c);
 void waitaofCommand(client *c);
 void georadiusbymemberCommand(client *c);
