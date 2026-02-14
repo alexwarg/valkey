@@ -1256,6 +1256,371 @@ ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val) {
     return rdbSaveAuxField(rdb, key, strlen(key), buf, vlen);
 }
 
+#define RDB_REPL_MASTERS_MAX 1024
+#define RDB_REPL_RUNTIME_MAX 1024
+#define RDB_REPL_RUNTIME_PENDING_MAX 200000
+#define RDB_RREPLAY_SEEN_MAX_ENTRIES 10000
+
+typedef struct hlcPersistEntry {
+    sds key;
+    hlc ts;
+} hlcPersistEntry;
+
+/* Comparison by recency: older < newer. */
+static int hlcPersistEntryCompare(const hlcPersistEntry *a, const hlcPersistEntry *b) {
+    int cmp = hlcCompare(&a->ts, &b->ts);
+    if (cmp != 0) return cmp;
+    return sdscmp(a->key, b->key);
+}
+
+static void hlcPersistEntrySwap(hlcPersistEntry *a, hlcPersistEntry *b) {
+    hlcPersistEntry tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+/* Min-heap ordered by recency, so root is the oldest persisted candidate. */
+static void hlcPersistHeapSiftUp(hlcPersistEntry *heap, unsigned long idx) {
+    while (idx > 0) {
+        unsigned long parent = (idx - 1) / 2;
+        if (hlcPersistEntryCompare(&heap[idx], &heap[parent]) >= 0) break;
+        hlcPersistEntrySwap(&heap[idx], &heap[parent]);
+        idx = parent;
+    }
+}
+
+static void hlcPersistHeapSiftDown(hlcPersistEntry *heap, unsigned long size, unsigned long idx) {
+    while (1) {
+        unsigned long left = (2 * idx) + 1;
+        unsigned long right = left + 1;
+        unsigned long smallest = idx;
+        if (left < size && hlcPersistEntryCompare(&heap[left], &heap[smallest]) < 0) {
+            smallest = left;
+        }
+        if (right < size && hlcPersistEntryCompare(&heap[right], &heap[smallest]) < 0) {
+            smallest = right;
+        }
+        if (smallest == idx) break;
+        hlcPersistEntrySwap(&heap[idx], &heap[smallest]);
+        idx = smallest;
+    }
+}
+
+static void hlcPersistHeapPushOrReplace(hlcPersistEntry *heap, unsigned long *size, unsigned long cap, hlcPersistEntry candidate) {
+    if (heap == NULL || size == NULL || cap == 0) return;
+    if (*size < cap) {
+        heap[*size] = candidate;
+        hlcPersistHeapSiftUp(heap, *size);
+        (*size)++;
+        return;
+    }
+    /* Replace root only if candidate is newer than the current oldest entry. */
+    if (hlcPersistEntryCompare(&candidate, &heap[0]) <= 0) return;
+    heap[0] = candidate;
+    hlcPersistHeapSiftDown(heap, *size, 0);
+}
+
+static int hlcPersistEntrySortDesc(const void *a, const void *b) {
+    const hlcPersistEntry *ea = a;
+    const hlcPersistEntry *eb = b;
+    int cmp = hlcPersistEntryCompare(ea, eb);
+    if (cmp < 0) return 1;
+    if (cmp > 0) return -1;
+    return 0;
+}
+
+static int rdbSaveInfoEnsureMastersCapacity(rdbSaveInfo *rsi, int count) {
+    if (rsi == NULL || count < 0 || count > RDB_REPL_MASTERS_MAX) return C_ERR;
+    if (count <= rsi->repl_masters_count) return C_OK;
+
+    sds *masters = zrealloc(rsi->repl_masters, sizeof(sds) * count);
+    for (int i = rsi->repl_masters_count; i < count; i++) {
+        masters[i] = NULL;
+    }
+    rsi->repl_masters = masters;
+    rsi->repl_masters_count = count;
+    return C_OK;
+}
+
+static int rdbSaveInfoEnsureRReplaySeenCapacity(rdbSaveInfo *rsi, int count) {
+    if (rsi == NULL || count < 0 || count > RDB_RREPLAY_SEEN_MAX_ENTRIES) return C_ERR;
+    if (count <= rsi->rreplay_seen_count) return C_OK;
+
+    sds *entries = zrealloc(rsi->rreplay_seen_entries, sizeof(sds) * count);
+    for (int i = rsi->rreplay_seen_count; i < count; i++) {
+        entries[i] = NULL;
+    }
+    rsi->rreplay_seen_entries = entries;
+    rsi->rreplay_seen_count = count;
+    return C_OK;
+}
+
+static int rdbSaveInfoEnsureRuntimeCapacity(rdbSaveInfo *rsi, int count) {
+    if (rsi == NULL || count < 0 || count > RDB_REPL_RUNTIME_MAX) return C_ERR;
+    if (count <= rsi->repl_runtime_count) return C_OK;
+
+    sds *entries = zrealloc(rsi->repl_runtime_entries, sizeof(sds) * count);
+    for (int i = rsi->repl_runtime_count; i < count; i++) {
+        entries[i] = NULL;
+    }
+    rsi->repl_runtime_entries = entries;
+    rsi->repl_runtime_count = count;
+    return C_OK;
+}
+
+static int rdbSaveInfoEnsureRuntimePendingCapacity(rdbSaveInfo *rsi, int count) {
+    if (rsi == NULL || count < 0 || count > RDB_REPL_RUNTIME_PENDING_MAX) return C_ERR;
+    if (count <= rsi->repl_runtime_pending_count) return C_OK;
+
+    sds *entries = zrealloc(rsi->repl_runtime_pending_entries, sizeof(sds) * count);
+    for (int i = rsi->repl_runtime_pending_count; i < count; i++) {
+        entries[i] = NULL;
+    }
+    rsi->repl_runtime_pending_entries = entries;
+    rsi->repl_runtime_pending_count = count;
+    return C_OK;
+}
+
+void rdbFreeSaveInfo(rdbSaveInfo *rsi) {
+    if (rsi == NULL) return;
+
+    if (rsi->repl_masters) {
+        for (int i = 0; i < rsi->repl_masters_count; i++) {
+            if (rsi->repl_masters[i]) sdsfree(rsi->repl_masters[i]);
+        }
+        zfree(rsi->repl_masters);
+        rsi->repl_masters = NULL;
+        rsi->repl_masters_count = 0;
+    }
+
+    if (rsi->hlc_key_clock) {
+        dictRelease(rsi->hlc_key_clock);
+        rsi->hlc_key_clock = NULL;
+    }
+
+    if (rsi->repl_runtime_entries) {
+        for (int i = 0; i < rsi->repl_runtime_count; i++) {
+            if (rsi->repl_runtime_entries[i]) sdsfree(rsi->repl_runtime_entries[i]);
+        }
+        zfree(rsi->repl_runtime_entries);
+        rsi->repl_runtime_entries = NULL;
+        rsi->repl_runtime_count = 0;
+    }
+
+    if (rsi->repl_runtime_pending_entries) {
+        for (int i = 0; i < rsi->repl_runtime_pending_count; i++) {
+            if (rsi->repl_runtime_pending_entries[i]) sdsfree(rsi->repl_runtime_pending_entries[i]);
+        }
+        zfree(rsi->repl_runtime_pending_entries);
+        rsi->repl_runtime_pending_entries = NULL;
+        rsi->repl_runtime_pending_count = 0;
+    }
+
+    if (rsi->rreplay_seen_entries) {
+        for (int i = 0; i < rsi->rreplay_seen_count; i++) {
+            if (rsi->rreplay_seen_entries[i]) sdsfree(rsi->rreplay_seen_entries[i]);
+        }
+        zfree(rsi->rreplay_seen_entries);
+        rsi->rreplay_seen_entries = NULL;
+        rsi->rreplay_seen_count = 0;
+    }
+    rsi->hlc_clock.wall_time = 0;
+}
+
+static int rdbSaveInfoEnsureHLCClockMap(rdbSaveInfo *rsi) {
+    if (rsi == NULL) return C_ERR;
+    if (rsi->hlc_key_clock != NULL) return C_OK;
+    rsi->hlc_key_clock = dictCreate(&sdsKeyHeapPointerValueDictType);
+    return rsi->hlc_key_clock != NULL ? C_OK : C_ERR;
+}
+
+/* Save the replication AUX fields (stream db, replication ID and offset),
+ * plus multi-master state (MVCC clocks, upstreams, RREPLAY dedupe) that must
+ * stay consistent with the replication offset. Also used by forkless sync. */
+int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi) {
+    serverAssert(rsi != NULL);
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
+    if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-wall", server.hlc_clock.wall_time) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-logical", server.hlc_clock.logical) == -1) return -1;
+    unsigned long upstream_count = server.upstreams ? listLength(server.upstreams) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-masters-count", upstream_count) == -1) return -1;
+    if (upstream_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long upstream_id = 0;
+
+        listRewind(server.upstreams, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            valkeyUpstream *upstream = listNodeValue(ln);
+            if (upstream == NULL || upstream->host == NULL) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "repl-master-%lu", upstream_id);
+            sds auxval = sdscatprintf(sdsempty(), "%s|%d", upstream->host, upstream->port);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+            upstream_id++;
+        }
+    }
+
+    unsigned long runtime_count = server.upstream_runtime ? listLength(server.upstream_runtime) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-count", runtime_count) == -1) return -1;
+    unsigned long runtime_pending_count = 0;
+    int runtime_pending_truncated = 0;
+    if (runtime_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long runtime_id = 0;
+
+        listRewind(server.upstream_runtime, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            if (runtime_id >= RDB_REPL_RUNTIME_MAX) break;
+            valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+            if (runtime == NULL || runtime->host == NULL) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "repl-runtime-%lu", runtime_id);
+            sds auxval = sdscatprintf(sdsempty(), "%s|%d|%llu|%llu|%llu|%llu|%llu",
+                                      runtime->host, runtime->port,
+                                      runtime->replay_last_sent_id, runtime->replay_last_acked_id,
+                                      runtime->replay_tx_frames, runtime->replay_rx_frames, runtime->replay_ack_frames);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+
+            if (runtime->replay_pending_frames) {
+                listIter pli;
+                listNode *pln;
+                listRewind(runtime->replay_pending_frames, &pli);
+                while ((pln = listNext(&pli)) != NULL) {
+                    if (runtime_pending_count >= RDB_REPL_RUNTIME_PENDING_MAX) {
+                        runtime_pending_truncated = 1;
+                        break;
+                    }
+                    rreplayPendingFrame *pending = listNodeValue(pln);
+                    if (pending == NULL || pending->replay_id == 0 || pending->frame == NULL) continue;
+
+                    sds pending_key = sdscatprintf(sdsempty(), "repl-runtime-pending-%lu", runtime_pending_count);
+                    uint64_t runtime_idx_be = htonu64((uint64_t)runtime_id);
+                    uint64_t replay_id_be = htonu64((uint64_t)pending->replay_id);
+                    sds pending_val = sdsnewlen(&runtime_idx_be, sizeof(runtime_idx_be));
+                    pending_val = sdscatlen(pending_val, &replay_id_be, sizeof(replay_id_be));
+                    pending_val = sdscatlen(pending_val, pending->frame, sdslen(pending->frame));
+                    rc = rdbSaveAuxField(rdb, pending_key, sdslen(pending_key), pending_val, sdslen(pending_val));
+                    sdsfree(pending_key);
+                    sdsfree(pending_val);
+                    if (rc == -1) return -1;
+                    runtime_pending_count++;
+                }
+            }
+            runtime_id++;
+        }
+
+        if (runtime_count > RDB_REPL_RUNTIME_MAX) {
+            serverLog(LL_WARNING,
+                      "Truncated MM runtime persistence to %d entries (had %lu)",
+                      RDB_REPL_RUNTIME_MAX, runtime_count);
+        }
+    }
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-pending-count", runtime_pending_count) == -1) return -1;
+    if (runtime_pending_truncated) {
+        serverLog(LL_WARNING,
+                  "Truncated MM runtime pending replay persistence to %d entries",
+                  RDB_REPL_RUNTIME_PENDING_MAX);
+    }
+
+    unsigned long hlc_count = server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-keys-count", hlc_count) == -1) return -1;
+    server.hlc_rdb_clock_entries_dropped_last_save = 0;
+    if (hlc_count) {
+        unsigned long cap = 0;
+        if (server.hlc_rdb_clock_max_entries > 0) {
+            unsigned long long configured_cap = (unsigned long long)server.hlc_rdb_clock_max_entries;
+            cap = configured_cap > ULONG_MAX ? ULONG_MAX : (unsigned long)configured_cap;
+        }
+
+        unsigned long heap_cap = min(cap, hlc_count);
+        hlcPersistEntry *heap = heap_cap ? zmalloc(sizeof(*heap) * heap_cap) : NULL;
+        unsigned long heap_size = 0;
+        unsigned long valid_entries = 0;
+
+        dictIterator di;
+        dictInitIterator(&di, server.hlc_key_clock);
+        dictEntry *de;
+
+        while ((de = dictNext(&di)) != NULL) {
+            sds hlc_key = dictGetKey(de);
+            hlc *clockp = dictGetVal(de);
+            if (hlc_key == NULL || clockp == NULL || (clockp->wall_time == 0 && clockp->logical == 0)) continue;
+            valid_entries++;
+
+            hlcPersistEntry candidate = {
+                .key = hlc_key,
+                .ts = *clockp,
+            };
+            hlcPersistHeapPushOrReplace(heap, &heap_size, heap_cap, candidate);
+        }
+
+        if (heap_size > 1) {
+            qsort(heap, heap_size, sizeof(*heap), hlcPersistEntrySortDesc);
+        }
+
+        for (unsigned long hlc_id = 0; hlc_id < heap_size; hlc_id++) {
+            uint64_t wall_be = htonu64(heap[hlc_id].ts.wall_time);
+            uint64_t logical_be = htonu64(heap[hlc_id].ts.logical);
+            sds auxkey = sdscatprintf(sdsempty(), "hlc-key-%lu", hlc_id);
+            sds auxval = sdsnewlen(&wall_be, sizeof(wall_be));
+            auxval = sdscatlen(auxval, &logical_be, sizeof(logical_be));
+            auxval = sdscatlen(auxval, heap[hlc_id].key, sdslen(heap[hlc_id].key));
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+        }
+
+        if (valid_entries > heap_size) {
+            server.hlc_rdb_clock_entries_dropped_last_save = valid_entries - heap_size;
+            serverLog(LL_WARNING,
+                      "Truncated HLC clock persistence to %lu entries (had %lu valid)",
+                      heap_size, valid_entries);
+        }
+
+        if (heap) zfree(heap);
+    }
+
+    unsigned long replay_seen_count = server.rreplay_seen_order ? listLength(server.rreplay_seen_order) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "rreplay-seen-count", replay_seen_count) == -1) return -1;
+    if (replay_seen_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long replay_seen_id = 0;
+
+        listRewind(server.rreplay_seen_order, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            if (replay_seen_id >= RDB_RREPLAY_SEEN_MAX_ENTRIES) break;
+
+            sds dedup_key = listNodeValue(ln);
+            if (dedup_key == NULL || sdslen(dedup_key) == 0) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "rreplay-seen-%lu", replay_seen_id);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), dedup_key, sdslen(dedup_key));
+            sdsfree(auxkey);
+            if (rc == -1) return -1;
+            replay_seen_id++;
+        }
+
+        if (replay_seen_count > RDB_RREPLAY_SEEN_MAX_ENTRIES) {
+            serverLog(LL_WARNING,
+                      "Truncated RREPLAY dedupe persistence to %d entries (had %lu)",
+                      RDB_RREPLAY_SEEN_MAX_ENTRIES, replay_seen_count);
+        }
+    }
+    return 1;
+}
+
 /* Save a few default AUX fields with information about the RDB generated. */
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void *) == 8) ? 64 : 32;
@@ -1268,11 +1633,7 @@ int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     if (rdbSaveAuxFieldStrInt(rdb, "used-mem", zmalloc_used_memory()) == -1) return -1;
 
     /* Handle saving options that generate aux fields. */
-    if (rsi) {
-        if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
-        if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
-        if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
-    }
+    if (rsi && rdbSaveInfoReplAuxFields(rdb, rsi) == -1) return -1;
     if (rdbSaveAuxFieldStrInt(rdb, "aof-base", aof_base) == -1) return -1;
 
     /* Handle additional dynamic aux fields */
@@ -3326,6 +3687,127 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 }
             } else if (!strcasecmp(objectGetVal(auxkey), "repl-offset")) {
                 if (rsi) rsi->repl_offset = strtoll(objectGetVal(auxval), NULL, 10);
+            } else if (!strcasecmp(objectGetVal(auxkey), "hlc-clock-wall")) {
+                if (rsi) {
+                    long long val = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (val > 0) rsi->hlc_clock.wall_time = (uint64_t)val;
+                }
+            } else if (!strcasecmp(objectGetVal(auxkey), "hlc-clock-logical")) {
+                if (rsi) {
+                    long long val = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (val >= 0) rsi->hlc_clock.logical = (uint64_t)val;
+                }
+            } else if (!strcasecmp(objectGetVal(auxkey), "repl-masters-count")) {
+                if (rsi) {
+                    long long count = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (count >= 0 && count <= RDB_REPL_MASTERS_MAX) {
+                        rdbSaveInfoEnsureMastersCapacity(rsi, (int)count);
+                    }
+                }
+            } else if (!strcasecmp(objectGetVal(auxkey), "repl-runtime-count")) {
+                if (rsi) {
+                    long long count = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (count >= 0 && count <= RDB_REPL_RUNTIME_MAX) {
+                        rdbSaveInfoEnsureRuntimeCapacity(rsi, (int)count);
+                    }
+                }
+            } else if (!strcasecmp(objectGetVal(auxkey), "repl-runtime-pending-count")) {
+                if (rsi) {
+                    long long count = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (count >= 0 && count <= RDB_REPL_RUNTIME_PENDING_MAX) {
+                        rdbSaveInfoEnsureRuntimePendingCapacity(rsi, (int)count);
+                    }
+                }
+            } else if (!strcasecmp(objectGetVal(auxkey), "hlc-keys-count")) {
+                /* Size hint only; actual entries are loaded from hlc-key-N AUX fields. */
+            } else if (!strcasecmp(objectGetVal(auxkey), "rreplay-seen-count")) {
+                if (rsi) {
+                    long long count = strtoll(objectGetVal(auxval), NULL, 10);
+                    if (count >= 0 && count <= RDB_RREPLAY_SEEN_MAX_ENTRIES) {
+                        rdbSaveInfoEnsureRReplaySeenCapacity(rsi, (int)count);
+                    }
+                }
+            } else if (!strncasecmp(objectGetVal(auxkey), "repl-master-", 12)) {
+                if (rsi) {
+                    char *suffix = (char *)objectGetVal(auxkey) + 12;
+                    char *endptr = NULL;
+                    long index = strtol(suffix, &endptr, 10);
+                    if (suffix[0] != '\0' && endptr && *endptr == '\0' &&
+                        index >= 0 && index < RDB_REPL_MASTERS_MAX &&
+                        rdbSaveInfoEnsureMastersCapacity(rsi, (int)index + 1) == C_OK) {
+                        if (rsi->repl_masters[index]) sdsfree(rsi->repl_masters[index]);
+                        rsi->repl_masters[index] = sdsdup(objectGetVal(auxval));
+                    }
+                }
+            } else if (!strncasecmp(objectGetVal(auxkey), "repl-runtime-pending-", 21)) {
+                if (rsi) {
+                    char *suffix = (char *)objectGetVal(auxkey) + 21;
+                    char *endptr = NULL;
+                    long index = strtol(suffix, &endptr, 10);
+                    if (suffix[0] != '\0' && endptr && *endptr == '\0' &&
+                        index >= 0 && index < RDB_REPL_RUNTIME_PENDING_MAX &&
+                        rdbSaveInfoEnsureRuntimePendingCapacity(rsi, (int)index + 1) == C_OK) {
+                        if (rsi->repl_runtime_pending_entries[index]) sdsfree(rsi->repl_runtime_pending_entries[index]);
+                        rsi->repl_runtime_pending_entries[index] = sdsdup(objectGetVal(auxval));
+                    }
+                }
+            } else if (!strncasecmp(objectGetVal(auxkey), "repl-runtime-", 13)) {
+                if (rsi) {
+                    char *suffix = (char *)objectGetVal(auxkey) + 13;
+                    char *endptr = NULL;
+                    long index = strtol(suffix, &endptr, 10);
+                    if (suffix[0] != '\0' && endptr && *endptr == '\0' &&
+                        index >= 0 && index < RDB_REPL_RUNTIME_MAX &&
+                        rdbSaveInfoEnsureRuntimeCapacity(rsi, (int)index + 1) == C_OK) {
+                        if (rsi->repl_runtime_entries[index]) sdsfree(rsi->repl_runtime_entries[index]);
+                        rsi->repl_runtime_entries[index] = sdsdup(objectGetVal(auxval));
+                    }
+                }
+            } else if (!strncasecmp(objectGetVal(auxkey), "rreplay-seen-", 13)) {
+                if (rsi) {
+                    char *suffix = (char *)objectGetVal(auxkey) + 13;
+                    char *endptr = NULL;
+                    long index = strtol(suffix, &endptr, 10);
+                    if (suffix[0] != '\0' && endptr && *endptr == '\0' &&
+                        index >= 0 && index < RDB_RREPLAY_SEEN_MAX_ENTRIES &&
+                        rdbSaveInfoEnsureRReplaySeenCapacity(rsi, (int)index + 1) == C_OK) {
+                        if (rsi->rreplay_seen_entries[index]) sdsfree(rsi->rreplay_seen_entries[index]);
+                        rsi->rreplay_seen_entries[index] = sdsdup(objectGetVal(auxval));
+                    }
+                }
+            } else if (!strncasecmp(objectGetVal(auxkey), "hlc-key-", 8)) {
+                if (rsi) {
+                    sds raw = objectGetVal(auxval);
+                    if (sdslen(raw) < sizeof(uint64_t) * 2) {
+                        decrRefCount(auxkey);
+                        decrRefCount(auxval);
+                        goto eoferr;
+                    }
+                    if (rdbSaveInfoEnsureHLCClockMap(rsi) != C_OK) {
+                        decrRefCount(auxkey);
+                        decrRefCount(auxval);
+                        goto eoferr;
+                    }
+
+                    uint64_t wall_be = 0, logical_be = 0;
+                    memcpy(&wall_be, raw, sizeof(uint64_t));
+                    memcpy(&logical_be, raw + sizeof(uint64_t), sizeof(uint64_t));
+                    hlc ts = {ntohu64(wall_be), ntohu64(logical_be)};
+                    if (hlcCompare(&ts, &rsi->hlc_clock) > 0) rsi->hlc_clock = ts;
+
+                    sds hlc_key = sdsnewlen(raw + sizeof(uint64_t) * 2, sdslen(raw) - sizeof(uint64_t) * 2);
+                    hlc *clockp = zmalloc(sizeof(*clockp));
+                    *clockp = ts;
+                    if (dictAdd(rsi->hlc_key_clock, hlc_key, clockp) != DICT_OK) {
+                        dictEntry *de = dictFind(rsi->hlc_key_clock, hlc_key);
+                        if (de) {
+                            hlc *existing = dictGetVal(de);
+                            if (existing && hlcCompare(&ts, existing) > 0) *existing = ts;
+                        }
+                        sdsfree(hlc_key);
+                        zfree(clockp);
+                    }
+                }
             } else if (!strcasecmp(objectGetVal(auxkey), "lua")) {
                 /* Won't load the script back in memory anymore. */
             } else if (!strcasecmp(objectGetVal(auxkey), "redis-ver")) {

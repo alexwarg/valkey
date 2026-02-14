@@ -153,10 +153,14 @@ struct ValkeyModule;
 #define CONFIG_RUN_ID_SIZE 40
 #define RDB_EOF_MARK_SIZE 40
 #define CONFIG_REPL_BACKLOG_MIN_SIZE (1024 * 16) /* 16k */
-#define CONFIG_BGSAVE_RETRY_DELAY 5              /* Wait a few secs before trying again. */
+#define CONFIG_DEFAULT_HLC_RDB_CLOCK_MAX_ENTRIES 200000
+#define CONFIG_DEFAULT_RREPLAY_PENDING_MAX_ENTRIES 50000
+#define CONFIG_DEFAULT_HLC_MAX_CLOCK_DRIFT_USEC 500000 /* Default HLC drift tolerance: 500 ms in microseconds. https://cse.buffalo.edu/tech-reports/2014-04.pdf  */
+#define CONFIG_BGSAVE_RETRY_DELAY 5                    /* Wait a few secs before trying again. */
 #define CONFIG_DEFAULT_PID_FILE "/var/run/valkey.pid"
 #define CONFIG_DEFAULT_BINDADDR_COUNT 2
-#define CONFIG_DEFAULT_BINDADDR {"*", "-::*"}
+#define CONFIG_DEFAULT_BINDADDR \
+    { "*", "-::*" }
 #define CONFIG_BINDADDR_MAX 16
 #define CONFIG_MIN_RESERVED_FDS 32
 #define CONFIG_DEFAULT_PROC_TITLE_TEMPLATE "{title} {listen-addr} {server-mode}"
@@ -398,6 +402,7 @@ typedef enum {
     REPL_STATE_RECEIVE_IP_REPLY,      /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_CAPA_REPLY,    /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_VERSION_REPLY, /* Wait for REPLCONF reply */
+    REPL_STATE_RECEIVE_UUID_REPLY,    /* Wait for REPLCONF reply */
     REPL_STATE_RECEIVE_NODEID_REPLY,  /* Wait for REPLCONF reply */
     REPL_STATE_SEND_PSYNC,            /* Send PSYNC */
     REPL_STATE_RECEIVE_PSYNC_REPLY,   /* Wait for PSYNC reply */
@@ -452,9 +457,11 @@ typedef enum {
 #define REPLICA_CAPA_PSYNC2 (1 << 1)            /* Supports PSYNC2 protocol. */
 #define REPLICA_CAPA_DUAL_CHANNEL (1 << 2)      /* Supports dual channel replication sync */
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM (1 << 3) /* Supports skipping RDB checksum for sync requests. */
+#define REPLICA_CAPA_RREPLAY_PEER (1 << 7)      /* Internal peer link for multi-master RREPLAY forwarding. */
 
 /* Replica capability strings */
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM_STR "skip-rdb-checksum" /* Supports skipping RDB checksum for sync requests. */
+#define REPLICA_CAPA_RREPLAY_PEER_STR "rreplay-peer"
 
 /* Replica requirements */
 #define REPLICA_REQ_NONE 0
@@ -1111,90 +1118,91 @@ typedef enum {
 } clientIOState;
 
 typedef struct ClientFlags {
-    uint64_t primary : 1;                  /* This client is a primary */
-    uint64_t replica : 1;                  /* This client is a replica */
-    uint64_t monitor : 1;                  /* This client is a replica monitor, see MONITOR */
-    uint64_t multi : 1;                    /* This client is in a MULTI context */
-    uint64_t blocked : 1;                  /* The client is waiting in a blocking operation */
-    uint64_t dirty_cas : 1;                /* Watched keys modified. EXEC will fail. */
-    uint64_t close_after_reply : 1;        /* Close after writing entire reply. */
-    uint64_t unblocked : 1;                /* This client was unblocked and is stored in server.unblocked_clients */
-    uint64_t script : 1;                   /* This is a non connected client used by Lua */
-    uint64_t asking : 1;                   /* Client issued the ASKING command */
-    uint64_t close_asap : 1;               /* Close this client ASAP */
-    uint64_t unix_socket : 1;              /* Client connected via Unix domain socket */
-    uint64_t dirty_exec : 1;               /* EXEC will fail for errors while queueing */
-    uint64_t primary_force_reply : 1;      /* Queue replies even if is primary */
-    uint64_t force_aof : 1;                /* Force AOF propagation of current cmd. */
-    uint64_t force_repl : 1;               /* Force replication of current cmd. */
-    uint64_t pre_psync : 1;                /* Instance don't understand PSYNC. */
-    uint64_t readonly : 1;                 /* Cluster client is in read-only state. */
-    uint64_t pubsub : 1;                   /* Client is in Pub/Sub mode. */
-    uint64_t prevent_aof_prop : 1;         /* Don't propagate to AOF. */
-    uint64_t prevent_repl_prop : 1;        /* Don't propagate to replicas. */
-    uint64_t prevent_prop : 1;             /* Don't propagate to AOF or replicas. */
-    uint64_t pending_write : 1;            /* Client has output to send but a write handler is yet not installed. */
-    uint64_t pending_read : 1;             /* Client has output to send but a write handler is yet not installed. */
-    uint64_t buf_encoded : 1;              /* True if c->buf content is encoded (e.g. for copy avoidance) */
-    uint64_t reply_off : 1;                /* Don't send replies to client. */
-    uint64_t reply_skip_next : 1;          /* Set CLIENT_REPLY_SKIP for next cmd */
-    uint64_t reply_skip : 1;               /* Don't send just this reply. */
-    uint64_t lua_debug : 1;                /* Run EVAL in debug mode. */
-    uint64_t lua_debug_sync : 1;           /* EVAL debugging without fork() */
-    uint64_t module : 1;                   /* Non connected client used by some module. */
-    uint64_t protected : 1;                /* Client should not be freed for now. */
-    uint64_t executing_command : 1;        /* Indicates that the client is currently in the process of handling a command. */
-    uint64_t pending_command : 1;          /* Indicates the client has a fully parsed command ready for execution. */
-    uint64_t tracking : 1;                 /* Client enabled keys tracking in order to perform client side caching. */
-    uint64_t tracking_broken_redir : 1;    /* Target client is invalid. */
-    uint64_t tracking_bcast : 1;           /* Tracking in BCAST mode. */
-    uint64_t tracking_optin : 1;           /* Tracking in opt-in mode. */
-    uint64_t tracking_optout : 1;          /* Tracking in opt-out mode. */
-    uint64_t tracking_caching : 1;         /* CACHING yes/no was given, depending on optin/optout mode. */
-    uint64_t tracking_noloop : 1;          /* Don't send invalidation messages about writes performed by myself. */
-    uint64_t in_to_table : 1;              /* This client is in the timeout table. */
-    uint64_t protocol_error : 1;           /* Protocol error chatting with it. */
-    uint64_t close_after_command : 1;      /* Close after executing commands and writing entire reply. */
-    uint64_t deny_blocking : 1;            /* Indicate that the client should not be blocked. */
-    uint64_t repl_rdbonly : 1;             /* This client is a replica that only wants RDB without replication buffer. */
-    uint64_t no_evict : 1;                 /* This client is protected against client memory eviction. */
-    uint64_t allow_oom : 1;                /* Client used by RM_Call is allowed to fully execute scripts even when in OOM */
-    uint64_t no_touch : 1;                 /* This client will not touch LFU/LRU stats. */
-    uint64_t pushing : 1;                  /* This client is pushing notifications. */
-    uint64_t module_auth_has_result : 1;   /* Indicates a client in the middle of module based auth had been authenticated
-                                              from the Module. */
-    uint64_t module_prevent_aof_prop : 1;  /* Module client do not want to propagate to AOF */
-    uint64_t module_prevent_repl_prop : 1; /* Module client do not want to propagate to replica */
-    uint64_t reexecuting_command : 1;      /* The client is re-executing the command. */
-    uint64_t processing_command : 1;       /* The client is inside processCommandAndResetClient(). */
-    uint64_t replication_done : 1;         /* Indicate that replication has been done on the client */
-    uint64_t authenticated : 1;            /* Indicate a client has successfully authenticated */
-    uint64_t ever_authenticated : 1;       /* Indicate a client was ever successfully authenticated during it's lifetime */
-    uint64_t protected_rdb_channel : 1;    /* Dual channel replication sync: Protects the RDB client from premature \
-                                            * release during full sync. This flag is used to ensure that the RDB client, which \
-                                            * references the first replication data block required by the replica, is not \
-                                            * released prematurely. Protecting the client is crucial for prevention of \
-                                            * synchronization failures: \
-                                            * If the RDB client is released before the replica initiates PSYNC, the primary \
-                                            * will reduce the reference count (o->refcount) of the block needed by the replica.
-                                            * \
-                                            * This could potentially lead to the removal of the required data block, resulting \
-                                            * in synchronization failures. Such failures could occur even in scenarios where \
-                                            * the replica only needs an additional 4KB beyond the minimum size of the
-                                            * repl_backlog.
-                                            * By using this flag, we ensure that the RDB client remains intact until the replica
-                                            * \ has successfully initiated PSYNC. */
-    uint64_t repl_rdb_channel : 1;         /* Dual channel replication sync: track a connection which is used for rdb snapshot */
-    uint64_t dont_cache_primary : 1;       /* In some cases we don't want to cache the primary. For example, the replica
-                                            * knows that it does not need the cache and required a full sync. With this
-                                            * flag, we won't cache the primary in freeClient. */
-    uint64_t fake : 1;                     /* This is a fake client without a real connection. */
-    uint64_t import_source : 1;            /* This client is importing data to server and can visit expired key. */
-    uint64_t buffered_reply : 1;           /* Indicates the reply for the current command was buffered, either in client::reply
-                                              or client::buf. */
-    uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
-                                              current command. */
-    uint64_t argv_borrowed : 1;            /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
+    uint64_t primary : 1;                      /* This client is a primary */
+    uint64_t replica : 1;                      /* This client is a replica */
+    uint64_t monitor : 1;                      /* This client is a replica monitor, see MONITOR */
+    uint64_t multi : 1;                        /* This client is in a MULTI context */
+    uint64_t blocked : 1;                      /* The client is waiting in a blocking operation */
+    uint64_t dirty_cas : 1;                    /* Watched keys modified. EXEC will fail. */
+    uint64_t close_after_reply : 1;            /* Close after writing entire reply. */
+    uint64_t unblocked : 1;                    /* This client was unblocked and is stored in server.unblocked_clients */
+    uint64_t script : 1;                       /* This is a non connected client used by Lua */
+    uint64_t asking : 1;                       /* Client issued the ASKING command */
+    uint64_t close_asap : 1;                   /* Close this client ASAP */
+    uint64_t unix_socket : 1;                  /* Client connected via Unix domain socket */
+    uint64_t dirty_exec : 1;                   /* EXEC will fail for errors while queueing */
+    uint64_t primary_force_reply : 1;          /* Queue replies even if is primary */
+    uint64_t force_aof : 1;                    /* Force AOF propagation of current cmd. */
+    uint64_t force_repl : 1;                   /* Force replication of current cmd. */
+    uint64_t pre_psync : 1;                    /* Instance don't understand PSYNC. */
+    uint64_t readonly : 1;                     /* Cluster client is in read-only state. */
+    uint64_t pubsub : 1;                       /* Client is in Pub/Sub mode. */
+    uint64_t prevent_aof_prop : 1;             /* Don't propagate to AOF. */
+    uint64_t prevent_repl_prop : 1;            /* Don't propagate to replicas. */
+    uint64_t prevent_prop : 1;                 /* Don't propagate to AOF or replicas. */
+    uint64_t pending_write : 1;                /* Client has output to send but a write handler is yet not installed. */
+    uint64_t pending_read : 1;                 /* Client has output to send but a write handler is yet not installed. */
+    uint64_t buf_encoded : 1;                  /* True if c->buf content is encoded (e.g. for copy avoidance) */
+    uint64_t reply_off : 1;                    /* Don't send replies to client. */
+    uint64_t reply_skip_next : 1;              /* Set CLIENT_REPLY_SKIP for next cmd */
+    uint64_t reply_skip : 1;                   /* Don't send just this reply. */
+    uint64_t lua_debug : 1;                    /* Run EVAL in debug mode. */
+    uint64_t lua_debug_sync : 1;               /* EVAL debugging without fork() */
+    uint64_t module : 1;                       /* Non connected client used by some module. */
+    uint64_t protected : 1;                    /* Client should not be freed for now. */
+    uint64_t executing_command : 1;            /* Indicates that the client is currently in the process of handling a command. */
+    uint64_t pending_command : 1;              /* Indicates the client has a fully parsed command ready for execution. */
+    uint64_t tracking : 1;                     /* Client enabled keys tracking in order to perform client side caching. */
+    uint64_t tracking_broken_redir : 1;        /* Target client is invalid. */
+    uint64_t tracking_bcast : 1;               /* Tracking in BCAST mode. */
+    uint64_t tracking_optin : 1;               /* Tracking in opt-in mode. */
+    uint64_t tracking_optout : 1;              /* Tracking in opt-out mode. */
+    uint64_t tracking_caching : 1;             /* CACHING yes/no was given, depending on optin/optout mode. */
+    uint64_t tracking_noloop : 1;              /* Don't send invalidation messages about writes performed by myself. */
+    uint64_t in_to_table : 1;                  /* This client is in the timeout table. */
+    uint64_t protocol_error : 1;               /* Protocol error chatting with it. */
+    uint64_t close_after_command : 1;          /* Close after executing commands and writing entire reply. */
+    uint64_t deny_blocking : 1;                /* Indicate that the client should not be blocked. */
+    uint64_t repl_rdbonly : 1;                 /* This client is a replica that only wants RDB without replication buffer. */
+    uint64_t no_evict : 1;                     /* This client is protected against client memory eviction. */
+    uint64_t allow_oom : 1;                    /* Client used by RM_Call is allowed to fully execute scripts even when in OOM */
+    uint64_t no_touch : 1;                     /* This client will not touch LFU/LRU stats. */
+    uint64_t pushing : 1;                      /* This client is pushing notifications. */
+    uint64_t module_auth_has_result : 1;       /* Indicates a client in the middle of module based auth had been authenticated
+                                                  from the Module. */
+    uint64_t module_prevent_aof_prop : 1;      /* Module client do not want to propagate to AOF */
+    uint64_t module_prevent_repl_prop : 1;     /* Module client do not want to propagate to replica */
+    uint64_t reexecuting_command : 1;          /* The client is re-executing the command. */
+    uint64_t processing_command : 1;           /* The client is inside processCommandAndResetClient(). */
+    uint64_t replication_done : 1;             /* Indicate that replication has been done on the client */
+    uint64_t skip_repl_stream_propagation : 1; /* Skip one propagation from primary stream to downstream replicas. */
+    uint64_t authenticated : 1;                /* Indicate a client has successfully authenticated */
+    uint64_t ever_authenticated : 1;           /* Indicate a client was ever successfully authenticated during it's lifetime */
+    uint64_t protected_rdb_channel : 1;        /* Dual channel replication sync: Protects the RDB client from premature \
+                                                * release during full sync. This flag is used to ensure that the RDB client, which \
+                                                * references the first replication data block required by the replica, is not \
+                                                * released prematurely. Protecting the client is crucial for prevention of \
+                                                * synchronization failures: \
+                                                * If the RDB client is released before the replica initiates PSYNC, the primary \
+                                                * will reduce the reference count (o->refcount) of the block needed by the replica.
+                                                * \
+                                                * This could potentially lead to the removal of the required data block, resulting \
+                                                * in synchronization failures. Such failures could occur even in scenarios where \
+                                                * the replica only needs an additional 4KB beyond the minimum size of the
+                                                * repl_backlog.
+                                                * By using this flag, we ensure that the RDB client remains intact until the replica
+                                                * \ has successfully initiated PSYNC. */
+    uint64_t repl_rdb_channel : 1;             /* Dual channel replication sync: track a connection which is used for rdb snapshot */
+    uint64_t dont_cache_primary : 1;           /* In some cases we don't want to cache the primary. For example, the replica
+                                                * knows that it does not need the cache and required a full sync. With this
+                                                * flag, we won't cache the primary in freeClient. */
+    uint64_t fake : 1;                         /* This is a fake client without a real connection. */
+    uint64_t import_source : 1;                /* This client is importing data to server and can visit expired key. */
+    uint64_t buffered_reply : 1;               /* Indicates the reply for the current command was buffered, either in client::reply
+                                                  or client::buf. */
+    uint64_t keyspace_notified : 1;            /* Indicates that a keyspace notification was triggered during the execution of the
+                                                  current command. */
+    uint64_t argv_borrowed : 1;                /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1236,6 +1244,7 @@ typedef struct ClientReplicationData {
     char replid[CONFIG_RUN_ID_SIZE + 1]; /* primary replication ID (if primary). */
     int replica_listening_port;          /* As configured with: REPLCONF listening-port */
     char *replica_addr;                  /* Optionally given by REPLCONF ip-address */
+    sds replica_uuid;                    /* Optionally given by REPLCONF uuid */
     int replica_version;                 /* Version on the form 0xMMmmpp. */
     short replica_capa;                  /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
     short replica_req;                   /* Replica requirements: REPLICA_REQ_* */
@@ -1608,6 +1617,66 @@ typedef enum {
     PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS
 } replicationErrorBehavior;
 
+/* Hybrid Logical Clock (HLC) representation */
+typedef struct {
+    uint64_t wall_time;
+    uint64_t logical;
+} hlc;
+
+/* Compare two hybrid logical clocks. Returns:
+ * 1 if a > b,
+ * -1 if a < b,
+ * 0 if a == b
+ *
+ * This first checks wall_time
+ * and falls back to logical to break ties.
+ */
+static inline int hlcCompare(const hlc *a, const hlc *b) {
+    if (a->wall_time > b->wall_time) return 1;
+    if (a->wall_time < b->wall_time) return -1;
+    if (a->logical > b->logical) return 1;
+    if (a->logical < b->logical) return -1;
+    return 0;
+}
+
+/* A configured upstream endpoint. For now this is a scaffold that mirrors
+ * the legacy single primary configuration. */
+typedef struct valkeyUpstream {
+    sds host;
+    int port;
+} valkeyUpstream;
+
+typedef struct rreplayPendingFrame {
+    unsigned long long replay_id;
+    sds frame;
+    int sent_once; /* 1 if the frame was sent on the current connection and is awaiting ACK. */
+} rreplayPendingFrame;
+
+/* Runtime state holder for configured upstreams. */
+typedef struct valkeyUpstreamRuntime {
+    sds host;
+    int port;
+    client *link_client;                         /* Forwarding connection client for this upstream, when available. */
+    client *incoming_client;                     /* Receiving connection client for this upstream. */
+    connection *forward_conn;                    /* Pending outbound forwarding connection, when connecting. */
+    sds replybuf;                                /* Small parser buffer for peer-forwarding command replies. */
+    int active_link;                             /* 1 when this upstream is currently active at runtime. */
+    int repl_state;                              /* Last known replication state for this upstream link. */
+    long long reploff;                           /* Last known replication offset for this upstream link. */
+    long long last_io_sec;                       /* Last known I/O timestamp in unix seconds. */
+    long long last_connect_attempt_sec;          /* Last outbound connect attempt timestamp. */
+    unsigned long long replay_last_sent_id;      /* Last replay-id sent to this peer. */
+    unsigned long long replay_last_acked_id;     /* Last replay-id acked by this peer. */
+    unsigned long long replay_last_received_id;  /* Last replay-id received from this peer. */
+    unsigned long long replay_tx_frames;         /* Total replay frames sent to this peer. */
+    unsigned long long replay_rx_frames;         /* Total replay frames received from this peer. */
+    unsigned long long replay_ack_frames;        /* Total replay ACK replies received from this peer. */
+    unsigned long long replay_pending_dropped;   /* Total pending replay frames dropped by queue cap. */
+    unsigned long long replay_fullsync_requests; /* Total peer full-sync requests sent after queue overflow. */
+    int replay_fullsync_required;                /* 1 when queue overflow requires peer full-sync before incremental replay. */
+    list *replay_pending_frames;                 /* Pending outbound replay frames awaiting ACK on peer-forward links. */
+} valkeyUpstreamRuntime;
+
 /* This structure can be optionally passed to RDB save/load functions in
  * order to implement additional functionalities, by storing and loading
  * metadata to the RDB file.
@@ -1624,9 +1693,20 @@ typedef struct rdbSaveInfo {
     int repl_id_is_set;                   /* True if repl_id field is set. */
     char repl_id[CONFIG_RUN_ID_SIZE + 1]; /* Replication ID. */
     long long repl_offset;                /* Replication offset. */
+    int repl_masters_count;               /* Number of configured upstreams persisted in RDB AUX. */
+    sds *repl_masters;                    /* Upstreams encoded as "<host>|<port>". */
+    int repl_runtime_count;               /* Number of upstream runtime entries persisted in RDB AUX. */
+    sds *repl_runtime_entries;            /* Runtime entries encoded as "<host>|<port>|<sent>|<acked>|<tx>|<rx>|<ack>". */
+    int repl_runtime_pending_count;       /* Number of pending replay queue entries persisted in RDB AUX. */
+    sds *repl_runtime_pending_entries;    /* Pending entries encoded as "<runtime-idx:u64><replay-id:u64><resp-frame-bytes...>". */
+    int rreplay_seen_count;               /* Number of persisted dedupe keys from RREPLAY. */
+    sds *rreplay_seen_entries;            /* Dedupe keys encoded as "<origin-uuid>:<replay-id>". */
+    hlc hlc_clock;                        /* Global HLC logical clock persisted in RDB AUX. */
+    dict *hlc_key_clock;                  /* Encoded key clock map loaded from RDB AUX. */
 } rdbSaveInfo;
 
-#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1}
+#define RDB_SAVE_INFO_INIT \
+    { -1, 0, "0000000000000000000000000000000000000000", -1, 0, NULL, 0, NULL, 0, NULL, 0, NULL, {0, 0}, NULL }
 
 struct malloc_stats {
     size_t zmalloc_used;
@@ -1815,6 +1895,8 @@ struct valkeyServer {
     list *clients_to_close;                /* Clients to close asynchronously */
     list *clients_pending_write;           /* There is to write or install handler. */
     list *replicas, *monitors;             /* List of replicas and MONITORs */
+    list *upstreams;                       /* Configured upstream endpoints (multi-master scaffold). */
+    list *upstream_runtime;                /* Runtime state per configured upstream (Phase 7 scaffold). */
     rax *replicas_waiting_psync;           /* Radix tree for tracking replicas awaiting partial synchronization.
                                             * Key: RDB client ID
                                             * Value: RDB client object
@@ -2152,13 +2234,26 @@ struct valkeyServer {
     list *repl_buffer_blocks;                   /* Replication buffers blocks list
                                                  * (serving replica clients and repl backlog) */
     /* Replication (replica) */
-    char *primary_user;     /* AUTH with this user and primary_auth with primary */
-    sds primary_auth;       /* AUTH with this password with primary */
-    char *primary_host;     /* Hostname of primary */
-    int primary_port;       /* Port of primary */
-    int repl_timeout;       /* Timeout after N seconds of primary idle */
-    client *primary;        /* Client that is primary for this replica */
-    uint64_t rdb_client_id; /* Rdb client id as it defined at primary side */
+    int active_replica;                                         /* If enabled, this node may accept writes while being a replica. */
+    int multi_master;                                           /* If enabled, allow multiple configured upstreams (scaffold). */
+    int multi_master_no_forward;                                /* If enabled, avoid forwarding replay traffic (scaffold). */
+    dict *rreplay_seen;                                         /* Recent replay frames for dedupe. Key: "<origin-uuid>:<replay-id>" */
+    list *rreplay_seen_order;                                   /* FIFO order for replay dedupe eviction. Values are sds keys in rreplay_seen. */
+    unsigned long long rreplay_seq;                             /* Local replay sequence generator used for outbound RREPLAY. */
+    long long rreplay_pending_max_entries;                      /* Per-upstream pending replay frame queue cap. */
+    dict *hlc_key_clock;                                        /* Key-level LWW clock map. Key: binary(dbid)+key-bytes, Value: hlc*. */
+    dict *hlc_key_tie_break;                                    /* Deterministic tie-break map. Key: binary(dbid)+key-bytes, Value: zstrdup("<uuid>:<id>"). */
+    hlc hlc_clock;                                              /* Hybrid logical clock */
+    long long hlc_rdb_clock_max_entries;                        /* Configurable cap for persisted HLC key clocks in RDB AUX. */
+    unsigned long long hlc_rdb_clock_entries_dropped_last_save; /* Last RDB save: valid HLC entries omitted by cap. */
+    long long hlc_max_clock_drift;                              /* Max tolerated microseconds between HLC wall time and physical time (0 = disabled). */
+    char *primary_user;                                         /* AUTH with this user and primary_auth with primary */
+    sds primary_auth;                                           /* AUTH with this password with primary */
+    char *primary_host;                                         /* Hostname of primary */
+    int primary_port;                                           /* Port of primary */
+    int repl_timeout;                                           /* Timeout after N seconds of primary idle */
+    client *primary;                                            /* Client that is primary for this replica */
+    uint64_t rdb_client_id;                                     /* Rdb client id as it defined at primary side */
     struct {
         connection *conn;
         char replid[CONFIG_RUN_ID_SIZE + 1];
@@ -2834,6 +2929,7 @@ extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
 extern dictType objectKeyHeapPointerValueDictType;
+extern dictType sdsKeyHeapPointerValueDictType;
 extern hashtableType setHashtableType;
 extern hashtableType zsetHashtableType;
 extern hashtableType kvstoreKeysHashtableType;
@@ -3212,8 +3308,10 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 /* Replication */
 int prepareReplicasToWrite(void);
 void replicationFeedReplicas(int dictid, robj **argv, int argc);
+void replicationFeedPrimaryWithRReplay(int dictid, robj **argv, int argc);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
+void replicationDetachUpstreamRuntimeClient(client *c);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
@@ -3226,6 +3324,12 @@ void replicationCachePrimary(client *c);
 void resizeReplicationBacklog(void);
 void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disconnect_blocked);
 void replicationUnsetPrimary(void);
+void replicationApplyRdbConfiguredUpstreams(const rdbSaveInfo *rsi);
+void replicationApplyRdbUpstreamRuntimeState(const rdbSaveInfo *rsi);
+void replicationApplyRdbRReplaySeen(const rdbSaveInfo *rsi);
+void replicationApplyRdbHLCState(const rdbSaveInfo *rsi);
+hlc replicationHLCGetKeyClock(int dbid, robj *key);
+void replicationHLCSetKeyClock(int dbid, robj *key, hlc ts);
 void refreshGoodReplicasCount(void);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
@@ -4053,6 +4157,7 @@ void expiretimeCommand(client *c);
 void pexpiretimeCommand(client *c);
 void persistCommand(client *c);
 void replicaofCommand(client *c);
+void multimasterCommand(client *c);
 void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);
@@ -4151,6 +4256,7 @@ void clusterKeySlotCommand(client *c);
 void clusterSlotStatsCommand(client *c);
 void clusterscanCommand(client *c);
 void restoreCommand(client *c);
+void hlcrestoreCommand(client *c);
 void migrateCommand(client *c);
 void askingCommand(client *c);
 void readonlyCommand(client *c);
@@ -4202,6 +4308,7 @@ void bitopCommand(client *c);
 void bitcountCommand(client *c);
 void bitposCommand(client *c);
 void replconfCommand(client *c);
+void rreplayCommand(client *c);
 void waitCommand(client *c);
 void waitaofCommand(client *c);
 void georadiusbymemberCommand(client *c);

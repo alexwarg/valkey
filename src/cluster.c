@@ -199,16 +199,35 @@ void dumpCommand(client *c) {
     return;
 }
 
-/* RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency] */
-void restoreCommand(client *c) {
+static void restoreGenericCommand(client *c, int use_hlc_ts) {
     long long ttl, lfu_freq = -1, lru_idle = -1;
     uint16_t rdbver = 0;
     rio payload;
     int j, type, replace = 0, absttl = 0;
+    uint64_t hlc_ts = 0;
     robj *obj;
+    int options_start = 4;
+
+    if (use_hlc_ts) {
+        long long hlc_ts_ll = 0;
+        if (getLongLongFromObjectOrReply(c, c->argv[4], &hlc_ts_ll, NULL) != C_OK) return;
+        if (hlc_ts_ll <= 0) {
+            addReplyError(c, "Invalid HLC timestamp, must be > 0");
+            return;
+        }
+        hlc_ts = hlc_ts_ll;
+        options_start = 5;
+
+        hlc current_clock = replicationHLCGetKeyClock(c->db->id, c->argv[1]);
+        hlc restore_clock = {hlc_ts, 0};
+        if (hlcCompare(&restore_clock, &current_clock) < 0) {
+            addReply(c, shared.ok);
+            return;
+        }
+    }
 
     /* Parse additional options */
-    for (j = 4; j < c->argc; j++) {
+    for (j = options_start; j < c->argc; j++) {
         int additional = c->argc - j - 1;
         if (!strcasecmp(objectGetVal(c->argv[j]), "replace")) {
             replace = 1;
@@ -313,8 +332,23 @@ void restoreCommand(client *c) {
     objectSetLRUOrLFU(obj, lfu_freq, lru_idle);
     signalModifiedKey(c, c->db, key);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "restore", key, c->db->id);
+    if (use_hlc_ts) {
+        hlc restore_clock = {hlc_ts, 0};
+        replicationHLCSetKeyClock(c->db->id, key, restore_clock);
+    }
     addReply(c, shared.ok);
     server.dirty++;
+}
+
+/* RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency] */
+void restoreCommand(client *c) {
+    restoreGenericCommand(c, 0);
+}
+
+/* HLCRESTORE key ttl serialized-value hlc-ts [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]
+ * Restore variant that updates key-level HLC clock used by active-active LWW replay. */
+void hlcrestoreCommand(client *c) {
+    restoreGenericCommand(c, 1);
 }
 /* MIGRATE socket cache implementation.
  *

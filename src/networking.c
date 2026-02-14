@@ -2179,6 +2179,10 @@ int freeClient(client *c) {
         listDelNode(server.clients_to_close, ln);
     }
 
+    /* Clear any multi-master runtime references to this client before
+     * replication-specific disconnection handling can early-return. */
+    replicationDetachUpstreamRuntimeClient(c);
+
     /* If it is our primary that's being disconnected we should make sure
      * to cache the state to try a partial resynchronization later.
      *
@@ -3420,6 +3424,7 @@ void resetClient(client *c) {
     c->slot = -1;
     c->flag.executing_command = 0;
     c->flag.replication_done = 0;
+    c->flag.skip_repl_stream_propagation = 0;
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
     c->net_output_bytes_curr_cmd = 0;
@@ -3952,17 +3957,20 @@ void commandProcessed(client *c) {
     if (isReplicatedClient(c)) {
         long long applied = c->repl_data->reploff - prev_offset;
         if (applied) {
-            char *stream = c->querybuf + c->repl_data->repl_applied;
-            if (c->slot_migration_job) {
-                /* What was applied ends with a command (or EXEC), so the db
-                 * of the client is the one the proxied stream ends in. */
-                replicationFeedStreamFromSlotImport(c->repl_data->repl_applied_dbid, c->db->id, stream, applied);
-                c->repl_data->repl_applied_dbid = c->db->id;
-            } else {
-                replicationFeedStreamFromPrimaryStream(stream, applied);
+            if (!c->flag.skip_repl_stream_propagation) {
+                char *stream = c->querybuf + c->repl_data->repl_applied;
+                if (c->slot_migration_job) {
+                    /* What was applied ends with a command (or EXEC), so the db
+                     * of the client is the one the proxied stream ends in. */
+                    replicationFeedStreamFromSlotImport(c->repl_data->repl_applied_dbid, c->db->id, stream, applied);
+                    c->repl_data->repl_applied_dbid = c->db->id;
+                } else {
+                    replicationFeedStreamFromPrimaryStream(stream, applied);
+                }
             }
             c->repl_data->repl_applied += applied;
         }
+        c->flag.skip_repl_stream_propagation = 0;
     }
 }
 

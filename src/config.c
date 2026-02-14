@@ -2525,6 +2525,34 @@ static int isValidMptcp(int val, const char **err) {
     return 1;
 }
 
+static int isValidActiveReplicaConfig(int val, const char **err) {
+    if (!val && server.multi_master) {
+        *err = "active-replica cannot be disabled while multi-master is enabled";
+        return 0;
+    }
+    return 1;
+}
+
+static int isValidMultiMasterConfig(int val, const char **err) {
+    if (val && !server.active_replica) {
+        *err = "multi-master requires active-replica yes";
+        return 0;
+    }
+    if (!val && server.multi_master_no_forward) {
+        *err = "multi-master cannot be disabled while multi-master-no-forward is enabled";
+        return 0;
+    }
+    return 1;
+}
+
+static int isValidMultiMasterNoForwardConfig(int val, const char **err) {
+    if (val && !server.multi_master) {
+        *err = "multi-master-no-forward requires multi-master yes";
+        return 0;
+    }
+    return 1;
+}
+
 /* Validate specified string is a valid proc-title-template */
 static int isValidProcTitleTemplate(char *val, const char **err) {
     if (!validateProcTitleTemplate(val)) {
@@ -3298,6 +3326,9 @@ standardConfig static_configs[] = {
     createBoolConfig("replica-serve-stale-data", "slave-serve-stale-data", MODIFIABLE_CONFIG, server.repl_serve_stale_data, 1, NULL, NULL),
     createBoolConfig("replica-read-only", "slave-read-only", DEBUG_CONFIG | MODIFIABLE_CONFIG, server.repl_replica_ro, 1, NULL, NULL),
     createBoolConfig("replica-ignore-maxmemory", "slave-ignore-maxmemory", MODIFIABLE_CONFIG, server.repl_replica_ignore_maxmemory, 1, NULL, NULL),
+    createBoolConfig("active-replica", NULL, MODIFIABLE_CONFIG, server.active_replica, 0, isValidActiveReplicaConfig, NULL),
+    createBoolConfig("multi-master", NULL, MODIFIABLE_CONFIG, server.multi_master, 0, isValidMultiMasterConfig, NULL),
+    createBoolConfig("multi-master-no-forward", NULL, MODIFIABLE_CONFIG, server.multi_master_no_forward, 0, isValidMultiMasterNoForwardConfig, NULL),
     createBoolConfig("jemalloc-bg-thread", NULL, MODIFIABLE_CONFIG, server.jemalloc_bg_thread, 1, NULL, updateJemallocBgThread),
     createBoolConfig("activedefrag", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.active_defrag_enabled, CONFIG_ACTIVE_DEFRAG_DEFAULT, isValidActiveDefrag, NULL),
     createBoolConfig("syslog-enabled", NULL, IMMUTABLE_CONFIG, server.syslog_enabled, 0, NULL, NULL),
@@ -3463,6 +3494,13 @@ standardConfig static_configs[] = {
     createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.proto_max_bulk_len, 512ll * 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.repl_backlog_size, 10 * 1024 * 1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 10mb */
+    createLongLongConfig("rreplay-pending-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.rreplay_pending_max_entries, CONFIG_DEFAULT_RREPLAY_PENDING_MAX_ENTRIES, INTEGER_CONFIG, NULL, NULL),
+    /* hlc-rdb-clock-max-entries controls the maximum number of persisted HLC key clocks in RDB AUX. */
+    createLongLongConfig("hlc-rdb-clock-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.hlc_rdb_clock_max_entries, CONFIG_DEFAULT_HLC_RDB_CLOCK_MAX_ENTRIES, INTEGER_CONFIG, NULL, NULL),
+    /* hlc-max-clock-drift is the maximum tolerated drift (in microseconds) between the HLC wall
+     * time and the local physical clock. 
+     * Set to 0 to disable checks. Default: 500 ms. */
+    createLongLongConfig("hlc-max-clock-drift", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.hlc_max_clock_drift, CONFIG_DEFAULT_HLC_MAX_CLOCK_DRIFT_USEC, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("cluster-manual-failover-timeout", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.cluster_mf_timeout, 5000, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned Long Long configs */
