@@ -867,26 +867,26 @@ static void queueUpstreamForwardHandshake(client *c) {
 }
 
 
-static void upstreamRuntimeRequestPeerFullResync(valkeyUpstreamRuntime *runtime) {
-    if (runtime == NULL || runtime->link_client == NULL) return;
-    if (!runtime->replay_fullsync_required) return;
+// static void upstreamRuntimeRequestPeerFullResync(valkeyUpstreamRuntime *runtime) {
+//     if (runtime == NULL || runtime->link_client == NULL) return;
+//     if (!runtime->replay_fullsync_required) return;
 
-    const char *host = upstreamForwardAdvertisedHost();
-    int port = upstreamForwardAdvertisedPort();
-    char portbuf[32];
-    ll2string(portbuf, sizeof(portbuf), port);
+//     const char *host = upstreamForwardAdvertisedHost();
+//     int port = upstreamForwardAdvertisedPort();
+//     char portbuf[32];
+//     ll2string(portbuf, sizeof(portbuf), port);
 
-    const char *argv[] = {"REPLICAOF", host, portbuf};
-    size_t argv_lens[] = {9, strlen(host), strlen(portbuf)};
-    queueUpstreamForwardCommand(runtime->link_client, 3, argv, argv_lens);
+//     const char *argv[] = {"REPLICAOF", host, portbuf};
+//     size_t argv_lens[] = {9, strlen(host), strlen(portbuf)};
+//     queueUpstreamForwardCommand(runtime->link_client, 3, argv, argv_lens);
 
-    runtime->replay_fullsync_requests++;
-    runtime->replay_fullsync_required = 0;
-    if (runtime->replay_pending_frames) listEmpty(runtime->replay_pending_frames);
-    serverLog(LL_WARNING,
-              "Requested peer full sync for upstream %s:%d after replay queue overflow (target primary %s:%d)",
-              runtime->host ? runtime->host : "?", runtime->port, host, port);
-}
+//     runtime->replay_fullsync_requests++;
+//     runtime->replay_fullsync_required = 0;
+//     if (runtime->replay_pending_frames) listEmpty(runtime->replay_pending_frames);
+//     serverLog(LL_WARNING,
+//               "Requested peer full sync for upstream %s:%d after replay queue overflow (target primary %s:%d)",
+//               runtime->host ? runtime->host : "?", runtime->port, host, port);
+// }
 
 static int processUpstreamForwardReplyBuffer(valkeyUpstreamRuntime *runtime) {
     if (runtime == NULL || runtime->replybuf == NULL) return C_OK;
@@ -7625,7 +7625,6 @@ void multimasterCommand(client *c){
         // int removing_current =
         //     server.primary_host && !strcasecmp(server.primary_host, objectGetVal(c->argv[2])) && server.primary_port == port;
         if(c->argc == 2){
-            const char *ip =  upstreamForwardAdvertisedHost();
             sds portstr = getReplicaPortString();
 
 
@@ -7668,9 +7667,6 @@ void multimasterCommand(client *c){
         // }
         addReply(c, shared.ok);
         return;
-    } else{
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
     }
 
     // multimaster no one isnt required anymore
@@ -7687,7 +7683,7 @@ void multimasterCommand(client *c){
     //     clearConfiguredUpstreams();
     // }
 
-addReply(c, shared.ok);
+addReplyErrorObject(c, shared.syntaxerr);
 }
 
 void replicaofCommand(client *c) {
