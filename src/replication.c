@@ -7572,19 +7572,19 @@ void replicationHandlePrimaryDisconnection(void) {
 void multimasterCommand(client *c){
 
     if (server.cluster_enabled) {
-        addReplyError(c, "REPLICAOF not allowed in cluster mode.");
+        addReplyError(c, "MULTIMASTER not allowed in cluster mode.");
         return;
     }
 
     if (server.failover_state != NO_FAILOVER) {
-        addReplyError(c, "REPLICAOF not allowed while failing over.");
+        addReplyError(c, "MULTIMASTER not allowed while failing over.");
         return;
     }
 
     if (c->argc == 4 && !strcasecmp(objectGetVal(c->argv[1]), "add")) {
         long port;
         if (!server.multi_master) {
-            addReplyError(c, "REPLICAOF ADD requires multi-master yes");
+            addReplyError(c, "MULTIMASTER ADD requires multi-master yes");
             return;
         }
         if (c->flag.replica) {
@@ -7607,7 +7607,7 @@ void multimasterCommand(client *c){
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "remove")) {
         long port;
         if (!server.multi_master) {
-            addReplyError(c, "REPLICAOF REMOVE requires multi-master yes");
+            addReplyError(c, "MULTIMASTER REMOVE requires multi-master yes");
             return;
         }
 
