@@ -3553,6 +3553,7 @@ void replicationFeedPrimaryWithRReplay(int dictid, robj **argv, int argc);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
 void replicationDetachUpstreamRuntimeClient(client *c);
+void replicationDetachUpstreamIncomingClient(client *c);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
