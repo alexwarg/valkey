@@ -803,9 +803,6 @@ static void queueUpstreamForwardCommand(client *c, int argc, const char **argv, 
     }
 }
 
-
-
-
 static void queueUpstreamForwardHandshake(client *c) {
     if (c == NULL) return;
 
@@ -824,21 +821,18 @@ static void queueUpstreamForwardHandshake(client *c) {
         queueUpstreamForwardCommand(c, auth_argc, auth_argv, auth_lens);
     }
 
-    
-
     const char *capa_argv[] = {"REPLCONF", "capa", REPLICA_CAPA_RREPLAY_PEER_STR};
     size_t capa_lens[] = {8, 4, strlen(REPLICA_CAPA_RREPLAY_PEER_STR)};
     queueUpstreamForwardCommand(c, 3, capa_argv, capa_lens);
 
     char ip[NET_IP_STR_LEN];
-    connAddrSockName(c->conn,ip,sizeof(ip),NULL);
+    connAddrSockName(c->conn, ip, sizeof(ip), NULL);
     sds portstr = getReplicaPortString();
-    const char *multimaster_peer_command[] = {"MULTIMASTER","ADD",ip,portstr};
-    size_t command_lens[] = {11, 3, strlen(ip),sdslen(portstr)};
-    queueUpstreamForwardCommand(c,4,multimaster_peer_command,command_lens);
+    const char *multimaster_peer_command[] = {"MULTIMASTER", "ADD", ip, portstr};
+    size_t command_lens[] = {11, 3, strlen(ip), sdslen(portstr)};
+    queueUpstreamForwardCommand(c, 4, multimaster_peer_command, command_lens);
     sdsfree(portstr);
 }
-
 
 
 static int processUpstreamForwardReplyBuffer(valkeyUpstreamRuntime *runtime) {
@@ -958,18 +952,17 @@ static void connectConfiguredUpstreamForwardLink(connection *conn) {
         valkeyUpstreamRuntime *existing_runtime = listNodeValue(ln);
         char *host = existing_runtime->host;
         char portbuf[32];
-        ll2string(portbuf,sizeof(portbuf),existing_runtime->port);
-        const char *argv[] = {"MULTIMASTER","add", host, portbuf};
+        ll2string(portbuf, sizeof(portbuf), existing_runtime->port);
+        const char *argv[] = {"MULTIMASTER", "add", host, portbuf};
 
-        if(!strcasecmp(runtime->host,host) && existing_runtime->port == runtime->port){
-            ln=next;
+        if (!strcasecmp(runtime->host, host) && existing_runtime->port == runtime->port) {
+            ln = next;
             continue;
         }
-        size_t argv_lens[] = {11,3, strlen(host), strlen(portbuf)};
+        size_t argv_lens[] = {11, 3, strlen(host), strlen(portbuf)};
         queueUpstreamForwardCommand(runtime->link_client, 4, argv, argv_lens);
         ln = next;
     }
-
 
     upstreamRuntimeFlushPendingReplayQueue(runtime);
     serverLog(LL_NOTICE, "Connected multi-master peer forwarding link to %s:%d", runtime->host, runtime->port);
@@ -1084,8 +1077,8 @@ void replicationDetachUpstreamRuntimeClient(client *c) {
     runtime->link_client = NULL;
 
     if (runtime->incoming_client == c) {
-            runtime->incoming_client = NULL;
-}
+        runtime->incoming_client = NULL;
+    }
     runtime->active_link = 0;
     runtime->repl_state = REPL_STATE_NONE;
     runtime->reploff = (long long)runtime->replay_last_acked_id;
@@ -3800,7 +3793,7 @@ void replconfCommand(client *c) {
                 c->repl_data->replica_capa |= REPLICA_CAPA_ZSTD;
             else if (!strcasecmp(objectGetVal(c->argv[j + 1]), REPLICA_CAPA_INBAND_REPL_STR))
                 c->repl_data->replica_capa |= REPLICA_CAPA_INBAND_REPL;
-            else if (!strcasecmp(objectGetVal(c->argv[j + 1]), REPLICA_CAPA_RREPLAY_PEER_STR)){
+            else if (!strcasecmp(objectGetVal(c->argv[j + 1]), REPLICA_CAPA_RREPLAY_PEER_STR)) {
                 c->repl_data->replica_capa |= REPLICA_CAPA_RREPLAY_PEER;
             }
         } else if (!strcasecmp(objectGetVal(c->argv[j]), "ack")) {
@@ -7515,10 +7508,8 @@ void replicationHandlePrimaryDisconnection(void) {
         connectWithPrimary();
     }
 }
-/* new command for active active replication. replicaof add works the same way but the hope is that it will be replaced with
- * this eventually */
-void multimasterCommand(client *c){
-
+/* multimaster command for active active replication*/
+void multimasterCommand(client *c) {
     if (server.cluster_enabled) {
         addReplyError(c, "MULTIMASTER not allowed in cluster mode.");
         return;
@@ -7544,9 +7535,7 @@ void multimasterCommand(client *c){
             addReplyError(c, "Failed to add upstream endpoint");
             return;
         }
-        if(c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER)){
-            
-
+        if (c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER)) {
             /* Only set incoming_client for the self-ADD (the first ADD a peer
              * sends about itself), not for third-party ADDs (a peer telling us
              * about other nodes).  The self-ADD is always sent first in the
@@ -7562,23 +7551,21 @@ void multimasterCommand(client *c){
                     valkeyUpstreamRuntime *r = listNodeValue(check_ln);
                     if (r->incoming_client == c) {
                         already_claimed = 1;
-                        
                     }
 
-                    if (!strcasecmp(r->host,objectGetVal(c->argv[2])) && port==r->port){
+                    if (!strcasecmp(r->host, objectGetVal(c->argv[2])) && port == r->port) {
                         foundmatch = r;
                     }
                 }
 
-                if (foundmatch){
-                    if(!already_claimed){
+                if (foundmatch) {
+                    if (!already_claimed) {
                         foundmatch->incoming_client = c;
                     }
-                    addReply(c,shared.ok);
+                    addReply(c, shared.ok);
                     return;
                 }
             }
-
         }
         addReply(c, shared.ok);
         return;
@@ -7589,9 +7576,9 @@ void multimasterCommand(client *c){
             addReplyError(c, "MULTIMASTER REMOVE requires multi-master yes");
             return;
         }
-        
-        if(c->argc == 2){
-            if(c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER))
+
+        if (c->argc == 2) {
+            if (c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER))
             // iterates through the upstream list to try and match the ip address that initiated the remove command
             {
                 listIter li;
@@ -7599,44 +7586,43 @@ void multimasterCommand(client *c){
                 listRewind(server.upstream_runtime, &li);
                 while ((ln = listNext(&li)) != NULL) {
                     valkeyUpstreamRuntime *runtime = listNodeValue(ln);
-                    if(runtime->incoming_client == c){
-                        removeConfiguredUpstreamEndpoint(runtime->host,runtime->port);
-                        addReply(c,shared.ok);
+                    if (runtime->incoming_client == c) {
+                        removeConfiguredUpstreamEndpoint(runtime->host, runtime->port);
+                        addReply(c, shared.ok);
                         return;
                     }
                 }
-                addReplyErrorObject(c,shared.err);
+                /* sends an error message to the sending peer if the runtime that needs to be removed is not found
+                 * in the runtime list */
+                addReplyErrorObject(c, shared.err);
                 return;
             }
-            
-            else {
-            /* Full mesh remove: local command. Forward remove to all peers,
-            * then tear down all local upstreams. */
-            listNode *ln;
-            ln = listFirst(server.upstream_runtime);
-            while(ln!=NULL){
-                listNode *next = listNextNode(ln);
-                valkeyUpstreamRuntime *runtime = listNodeValue(ln);
-                if (runtime->link_client && runtime->link_client->conn) {
-                    const char *argv[] = {"MULTIMASTER","remove"};
-                    size_t argv_lens[] = {11,6};
-                    queueUpstreamForwardCommand(runtime->link_client,2,argv,argv_lens);
-                    writeToClient(runtime->link_client);
-                }
-                removeConfiguredUpstreamEndpoint(runtime->host,runtime->port);
-                ln=next;
-            }
-            addReply(c, shared.ok);
-            return;
-        }
-        }
 
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
+            else {
+                /* Full mesh remove: local command. Forward remove to all peers,
+                 * then tear down all local upstreams. */
+                listNode *ln;
+                ln = listFirst(server.upstream_runtime);
+                while (ln != NULL) {
+                    listNode *next = listNextNode(ln);
+                    valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+                    if (runtime->link_client && runtime->link_client->conn) {
+                        const char *argv[] = {"MULTIMASTER", "remove"};
+                        size_t argv_lens[] = {11, 6};
+                        queueUpstreamForwardCommand(runtime->link_client, 2, argv, argv_lens);
+                        writeToClient(runtime->link_client);
+                    }
+                    removeConfiguredUpstreamEndpoint(runtime->host, runtime->port);
+                    ln = next;
+                }
+                addReply(c, shared.ok);
+                return;
+            }
+        }
     }
 
 
-addReplyErrorObject(c, shared.syntaxerr);
+    addReplyErrorObject(c, shared.syntaxerr);
 }
 
 void replicaofCommand(client *c) {
@@ -7677,7 +7663,6 @@ void replicaofCommand(client *c) {
         if (getRangeLongFromObjectOrReply(c, c->argv[2], 0, 65535, &port, "Invalid master port") != C_OK) return;
 
         if (server.multi_master) {
-
             if (server.primary_host == NULL) {
                 replicationSetPrimary(objectGetVal(c->argv[1]), port, 0, true);
             } else if (server.primary_host && !strcasecmp(server.primary_host, objectGetVal(c->argv[1])) &&
