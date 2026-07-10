@@ -7515,8 +7515,8 @@ void replicationHandlePrimaryDisconnection(void) {
         connectWithPrimary();
     }
 }
-// ATHARVA: new command for active active replication. replicaof add works the same way but the hope is that it will be replaced with
-// this eventually
+/* new command for active active replication. replicaof add works the same way but the hope is that it will be replaced with
+ * this eventually */
 void multimasterCommand(client *c){
 
     if (server.cluster_enabled) {
@@ -7545,7 +7545,7 @@ void multimasterCommand(client *c){
             return;
         }
         if(c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER)){
-            //syncUpstreamRuntimeWithConfigured();
+            
 
             /* Only set incoming_client for the self-ADD (the first ADD a peer
              * sends about itself), not for third-party ADDs (a peer telling us
@@ -7605,13 +7605,13 @@ void multimasterCommand(client *c){
                         return;
                     }
                 }
-                addReplyErrorObject(c,shared.syntaxerr);
+                addReplyErrorObject(c,shared.err);
                 return;
             }
             
             else {
-            // Full mesh remove: local command. Forward remove to all peers,
-            // then tear down all local upstreams.
+            /* Full mesh remove: local command. Forward remove to all peers,
+            * then tear down all local upstreams. */
             listNode *ln;
             ln = listFirst(server.upstream_runtime);
             while(ln!=NULL){
