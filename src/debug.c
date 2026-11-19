@@ -466,6 +466,8 @@ void debugCommand(client *c) {
             "RELOAD [option ...]",
             "    Save the RDB on disk and reload it back to memory. Valid <option> values:",
             "    * MERGE: conflicting keys will be loaded from RDB.",
+            "    * MERGE-HLC: merge the existing RDB file into the database by per-key",
+            "      HLC clock, as a multi-master snapshot merge does (implies NOSAVE NOFLUSH).",
             "    * NOFLUSH: the existing database will not be removed before load, but",
             "      conflicting keys will generate an exception and kill the server.",
             "    * NOSAVE: the database will be loaded from an existing RDB file.",
@@ -570,7 +572,7 @@ void debugCommand(client *c) {
         sdsdup(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "reload")) {
-        int flush = 1, save = 1;
+        int flush = 1, save = 1, merge_hlc = 0;
         int flags = RDBFLAGS_NONE;
 
         /* Parse the additional options that modify the RELOAD
@@ -579,15 +581,30 @@ void debugCommand(client *c) {
             char *opt = objectGetVal(c->argv[j]);
             if (!strcasecmp(opt, "MERGE")) {
                 flags |= RDBFLAGS_ALLOW_DUP;
+            } else if (!strcasecmp(opt, "MERGE-HLC")) {
+                merge_hlc = 1;
             } else if (!strcasecmp(opt, "NOFLUSH")) {
                 flush = 0;
             } else if (!strcasecmp(opt, "NOSAVE")) {
                 save = 0;
             } else {
                 addReplyError(c, "DEBUG RELOAD only supports the "
-                                 "MERGE, NOFLUSH and NOSAVE options.");
+                                 "MERGE, MERGE-HLC, NOFLUSH and NOSAVE options.");
                 return;
             }
+        }
+
+        /* MERGE-HLC merges the RDB file into the dataset by per-key HLC, as a
+         * multi-master snapshot merge does. Saving first would overwrite the
+         * snapshot, and flushing would defeat the merge. */
+        if (merge_hlc) {
+            if (flags & RDBFLAGS_ALLOW_DUP) {
+                addReplyError(c, "DEBUG RELOAD MERGE-HLC cannot be combined with MERGE.");
+                return;
+            }
+            flags |= RDBFLAGS_MERGE_HLC;
+            save = 0;
+            flush = 0;
         }
 
         /* The default behavior is to save the RDB file before loading
@@ -606,9 +623,13 @@ void debugCommand(client *c) {
          * used together with NOFLUSH, we are able to merge two datasets. */
         if (flush) flags |= RDBFLAGS_EMPTY_DATA;
 
+        rdbSaveInfo merge_rsi = RDB_SAVE_INFO_INIT;
+        if (merge_hlc) replicationMergeSnapshotBegin();
         protectClient(c);
-        int ret = rdbLoad(server.rdb_filename, NULL, flags);
+        int ret = rdbLoad(server.rdb_filename, merge_hlc ? &merge_rsi : NULL, flags);
         unprotectClient(c);
+        if (merge_hlc && ret == RDB_OK) replicationMergeSnapshotFinish(&merge_rsi);
+        rdbFreeSaveInfo(&merge_rsi);
         if (ret != RDB_OK) {
             addReplyError(c, "Error trying to load the RDB dump, check server logs.");
             return;
