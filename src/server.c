@@ -3838,6 +3838,8 @@ static int shouldForwardToPrimaryViaRReplay(int target) {
      * peer-forward mode, RREPLAY frames come from replica links (rreplay-peer),
      * not only from the primary link. */
     if (server.current_client->flag.primary || server.current_client->flag.replica) return 0;
+    /* Peer links carry no primary/replica flag but deliver RREPLAY too. */
+    if (isApplyingRReplay()) return 0;
     if (server.current_client->slot_migration_job) return 0;
     return 1;
 }

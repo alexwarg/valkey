@@ -2601,6 +2601,16 @@ static int clientIsRReplayPeerLink(const client *c) {
     return c && c->repl_data && (c->repl_data->replica_capa & REPLICA_CAPA_RREPLAY_PEER);
 }
 
+/* Return true while a replication or peer link is executing an RREPLAY frame.
+ * This covers deferred propagation too, which runs after the payload's call()
+ * but before the outer RREPLAY command returns. Side effects of the payload,
+ * such as lazy expiry, must not be re-originated as new RREPLAY frames. */
+int isApplyingRReplay(void) {
+    client *c = server.current_client;
+    if (c == NULL || c->cmd == NULL || c->cmd->proc != rreplayCommand) return 0;
+    return c->flag.primary || c->flag.replica || clientIsRReplayPeerLink(c);
+}
+
 /* Encode argv/argc as one RESP array frame for reuse across multiple targets. */
 static sds encodeRespCommandFromArgv(robj **argv, int argc) {
     if (argv == NULL || argc <= 0) return NULL;
