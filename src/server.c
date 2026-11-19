@@ -6737,6 +6737,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "multi_master_merge_last_status:%s\r\n",
                 server.mm_merge_last_status < 0 ? "none" : (server.mm_merge_last_status ? "ok" : "err"),
                 "multi_master_merge_last_changes:%lld\r\n", server.mm_merge_last_changes,
+                "multi_master_merge_pending_peers:%d\r\n", replicationMergePendingPeers(),
                 "master_global_link_status:%s\r\n", master_global_link_status,
                 "connected_masters:%d\r\n", connected_masters,
                 "configured_upstreams:%lu\r\n", server.upstreams ? listLength(server.upstreams) : 0,
@@ -7578,6 +7579,11 @@ void loadDataFromDisk(void) {
         if (!rsi_is_valid && server.repl_backlog) freeReplicationBacklog();
         rdbFreeSaveInfo(&rsi);
     }
+
+    /* With or without a loaded dataset, multi-master peers may hold writes
+     * this node does not have: merge their snapshots before taking their
+     * replay frames. */
+    replicationScheduleStartupMerges();
 }
 
 void serverOutOfMemoryHandler(size_t allocation_size) {

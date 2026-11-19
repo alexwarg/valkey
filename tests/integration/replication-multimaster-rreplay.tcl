@@ -243,7 +243,10 @@ start_server {tags {"repl external:skip"} overrides {active-replica yes multi-ma
                 fail "Peer links were not established before HLC cap test"
             }
 
+            # node0 merges node1's snapshot at startup, so node1's snapshot
+            # must apply the same cap for the dropped clocks to stay dropped.
             $node0 config set hlc-rdb-clock-max-entries 5
+            $node1 config set hlc-rdb-clock-max-entries 5
             for {set i 1} {$i <= 8} {incr i} {
                 set key "mm:hlc-cap:$i"
                 $node1 set $key "seed-$i"
@@ -283,6 +286,11 @@ start_server {tags {"repl external:skip"} overrides {active-replica yes multi-ma
                 [s -1 active_upstream_runtime_links] >= 1
             } else {
                 fail "Peer links were not re-established after HLC cap restart"
+            }
+            wait_for_condition 100 100 {
+                [s -1 multi_master_merge_pending_peers] == 0
+            } else {
+                fail "node0 startup merge did not finish after HLC cap restart"
             }
 
             for {set i 1} {$i <= 8} {incr i} {
