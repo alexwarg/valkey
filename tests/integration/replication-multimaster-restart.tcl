@@ -75,5 +75,36 @@ start_server {overrides {save {} active-replica yes multi-master yes replica-rea
         assert_equal 0 [s -1 connected_slaves]
         assert_bidirectional_replication mm_restart_both
     }
+
+    test "MULTIMASTER MERGE restores a node restarted without RDB" {
+        set r1 [srv -1 client]
+        for {set i 0} {$i < 20} {incr i} { $r1 set mm_merge:pre:$i v$i }
+        $r1 rpush mm_merge:list a b c
+        wait_for_condition 50 100 {
+            [[srv 0 client] llen mm_merge:list] == 3
+        } else {
+            fail "data not replicated to node 0 before the restart"
+        }
+
+        set dir [lindex [[srv 0 client] config get dir] 1]
+        file delete [file join $dir dump.rdb]
+        restart_server 0 true false
+        assert_mm_primaries_linked
+        set r0 [srv 0 client]
+        assert_equal 0 [$r0 exists mm_merge:list]
+
+        assert_equal OK [$r0 multimaster merge [srv -1 host] [srv -1 port]]
+        wait_for_condition 100 100 {
+            [s 0 multi_master_merge_in_progress] == 0
+        } else {
+            fail "MULTIMASTER MERGE did not finish"
+        }
+        assert_equal ok [s 0 multi_master_merge_last_status]
+        assert_equal {a b c} [$r0 lrange mm_merge:list 0 -1]
+        assert_equal v19 [$r0 get mm_merge:pre:19]
+        assert_equal [$r1 debug digest] [$r0 debug digest]
+        assert_mm_primaries_linked
+        assert_bidirectional_replication mm_merge_after
+    }
 }
 }

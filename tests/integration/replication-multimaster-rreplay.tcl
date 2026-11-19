@@ -1,5 +1,5 @@
-start_server {tags {"repl external:skip"}} {
-    start_server {overrides {save {}}} {
+start_server {tags {"repl external:skip"} overrides {active-replica yes multi-master yes replica-read-only no}} {
+    start_server {overrides {save {} active-replica yes multi-master yes replica-read-only no}} {
         set node0 [srv -1 client]
         set node0_host [srv -1 host]
         set node0_port [srv -1 port]
@@ -7,7 +7,7 @@ start_server {tags {"repl external:skip"}} {
         set node1_host [srv 0 host]
         set node1_port [srv 0 port]
 
-        test {Replica link with active-replica enabled} {
+        test {Peer link with multi-master enabled} {
             $node0 config set active-replica yes
             $node0 config set multi-master yes
             $node0 config set replica-read-only no
@@ -15,11 +15,12 @@ start_server {tags {"repl external:skip"}} {
             $node1 config set multi-master yes
             $node1 config set replica-read-only no
 
-            $node1 replicaof $node0_host $node0_port
+            $node1 multimaster add $node0_host $node0_port
             wait_for_condition 100 100 {
-                [s 0 master_link_status] eq {up}
+                [s 0 active_upstream_runtime_links] >= 1 &&
+                [s -1 active_upstream_runtime_links] >= 1
             } else {
-                fail "Initial replica link not established"
+                fail "Initial peer link not established"
             }
         }
 
@@ -113,23 +114,22 @@ start_server {tags {"repl external:skip"}} {
         }
 
         test {RREPLAY MSET applies fresh keys without dropping the full command} {
-            $node0 set mm:mset:tmp1 old1
-            $node0 set mm:mset:tmp2 keep
-            set k1_payload [$node0 dump mm:mset:tmp1]
-            set k2_payload [$node0 dump mm:mset:tmp2]
-            $node0 del mm:mset:tmp1 mm:mset:tmp2 mm:mset:k1 mm:mset:k2
-            set base_clock [s -1 hlc_clock_wall]
+            $node0 del mm:mset:k1 mm:mset:k2
+            # Local writes on node0 are forwarded to its peer and stamped with
+            # the current clock, so set up the key clocks with replayed frames,
+            # slightly ahead of node0's clock (within hlc-max-clock-drift).
+            set base_clock [expr {[s -1 hlc_clock_wall] + 100000}]
             set k1_ts [expr {$base_clock + 10}]
             set k2_ts [expr {$base_clock + 1000}]
             set replay_ts [expr {$base_clock + 500}]
             set client_info [$node0 client info]
             set dbid 0
             regexp {db=([0-9]+)} $client_info _ dbid
-            $node0 hlcrestore mm:mset:k1 0 $k1_payload $k1_ts replace
-            $node0 hlcrestore mm:mset:k2 0 $k2_payload $k2_ts replace
 
             assert_equal OK [$node0 replconf capa rreplay-peer]
             assert_equal OK [$node0 replconf uuid 1111111111111111111111111111111111111111]
+            assert_equal 8991 [$node0 rreplay 2222222222222222222222222222222222222222 $dbid 8991 $k1_ts-0 set mm:mset:k1 old1]
+            assert_equal 8992 [$node0 rreplay 2222222222222222222222222222222222222222 $dbid 8992 $k2_ts-0 set mm:mset:k2 keep]
             assert_equal 9001 [$node0 rreplay 2222222222222222222222222222222222222222 $dbid 9001 $replay_ts-0 mset mm:mset:k1 new1 mm:mset:k2 new2]
 
             assert_equal "new1" [$node0 get mm:mset:k1]
@@ -147,9 +147,9 @@ start_server {tags {"repl external:skip"}} {
 
             assert_equal 1 [s -1 active_replica]
             assert_equal 1 [s -1 multi_master]
-            assert_equal 0 [s -1 configured_upstreams]
+            assert_equal 1 [s -1 configured_upstreams]
             assert_equal 1 [s 0 configured_upstreams]
-            assert_equal 0 [s -1 upstream_runtime_entries]
+            assert_equal 1 [s -1 upstream_runtime_entries]
             assert_equal 1 [s 0 upstream_runtime_entries]
             assert_equal 1 [s 0 active_upstream_runtime_links]
             assert {[s 0 upstream_runtime_replay_tx_frames] >= 1}
@@ -179,11 +179,11 @@ start_server {tags {"repl external:skip"}} {
             }
 
             assert {[s -1 rreplay_dedupe_entries] >= 1}
-            $node1 replicaof $node0_host $node0_port
             wait_for_condition 100 100 {
-                [s 0 master_link_status] eq {up}
+                [s 0 active_upstream_runtime_links] >= 1 &&
+                [s -1 active_upstream_runtime_links] >= 1
             } else {
-                fail "Replica link was not re-established after primary restart"
+                fail "Peer links were not re-established after node0 restart"
             }
         }
 
@@ -207,25 +207,12 @@ start_server {tags {"repl external:skip"}} {
             $node1 config set replica-read-only no
 
             assert_equal 1 [s 0 configured_upstreams]
-            wait_for_condition 400 100 {
-                [s 0 master_host] eq $node0_host &&
-                [s 0 master_port] == $node0_port &&
-                [s 0 master_link_status] eq {up}
-            } else {}
-            set restored_master_host [s 0 master_host]
-            set restored_master_port [s 0 master_port]
-            set restored_master_state [s 0 master_link_status]
-            if {$restored_master_host ne $node0_host ||
-                $restored_master_port != $node0_port ||
-                $restored_master_state ne "up"} {
-                $node1 replicaof $node0_host $node0_port
-            }
+            assert_equal master [s 0 role]
             wait_for_condition 200 100 {
-                [s 0 master_host] eq $node0_host &&
-                [s 0 master_port] == $node0_port &&
-                [s 0 master_link_status] eq {up}
+                [s 0 active_upstream_runtime_links] >= 1 &&
+                [s -1 active_upstream_runtime_links] >= 1
             } else {
-                fail "Configured upstream was restored but active primary link was not re-established after restart"
+                fail "Configured upstream was restored but peer links were not re-established after restart"
             }
 
             $node0 set mm:rdb-reconnect from-node0
@@ -249,11 +236,11 @@ start_server {tags {"repl external:skip"}} {
         }
 
         test {RDB HLC cap persists newest key clocks first} {
-            $node1 replicaof $node0_host $node0_port
             wait_for_condition 100 100 {
-                [s 0 master_link_status] eq {up}
+                [s 0 active_upstream_runtime_links] >= 1 &&
+                [s -1 active_upstream_runtime_links] >= 1
             } else {
-                fail "Replica link was not established before HLC cap test"
+                fail "Peer links were not established before HLC cap test"
             }
 
             $node0 config set hlc-rdb-clock-max-entries 5
@@ -291,11 +278,11 @@ start_server {tags {"repl external:skip"}} {
                 fail "Primary restart after HLC cap save did not finish loading"
             }
 
-            $node1 replicaof $node0_host $node0_port
             wait_for_condition 100 100 {
-                [s 0 master_link_status] eq {up}
+                [s 0 active_upstream_runtime_links] >= 1 &&
+                [s -1 active_upstream_runtime_links] >= 1
             } else {
-                fail "Replica link was not re-established after HLC cap restart"
+                fail "Peer links were not re-established after HLC cap restart"
             }
 
             for {set i 1} {$i <= 8} {incr i} {

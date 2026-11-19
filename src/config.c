@@ -671,6 +671,15 @@ void loadServerConfigFromString(sds config) {
         err = "replicaof directive not allowed in cluster mode";
         goto loaderr;
     }
+    /* Multi-master replaces primary/replica replication: nodes are peers. */
+    if (server.multi_master && server.cluster_enabled) {
+        err = "multi-master is not compatible with cluster mode";
+        goto loaderr;
+    }
+    if (server.multi_master && server.primary_host) {
+        err = "replicaof directive not allowed with multi-master; use MULTIMASTER ADD";
+        goto loaderr;
+    }
     if (server.forkless_policy != FORKLESS_POLICY_REQUIRE_FORK && !server.forkless_infrastructure_enabled) {
         err = "'forkless-policy prefer-forkless' can only be selected when the server was started with "
               "'forkless-infrastructure-enabled yes'";
@@ -2690,6 +2699,16 @@ static int isValidActiveReplicaConfig(int val, const char **err) {
 static int isValidMultiMasterConfig(int val, const char **err) {
     if (val && !server.active_replica) {
         *err = "multi-master requires active-replica yes";
+        return 0;
+    }
+    /* Only checked at runtime: while the config file is read, these options
+     * may not be set yet (see the sanity checks in loadServerConfigFromString). */
+    if (val && !reading_config_file && server.cluster_enabled) {
+        *err = "multi-master is not compatible with cluster mode";
+        return 0;
+    }
+    if (val && !reading_config_file && server.primary_host) {
+        *err = "multi-master cannot be enabled on a replica; run REPLICAOF NO ONE first";
         return 0;
     }
     if (!val && server.multi_master_no_forward) {

@@ -44,6 +44,25 @@
                                 "type": "integer"
                             }
                         ]
+                    },
+                    {
+                        "name": "merge-host-port",
+                        "type": "block",
+                        "arguments": [
+                            {
+                                "name": "merge",
+                                "type": "pure-token",
+                                "token": "MERGE"
+                            },
+                            {
+                                "name": "host",
+                                "type": "string"
+                            },
+                            {
+                                "name": "port",
+                                "type": "integer"
+                            }
+                        ]
                     }
                 ]
 
