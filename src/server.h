@@ -584,6 +584,10 @@ typedef enum {
 #define PROPAGATE_NONE 0
 #define PROPAGATE_AOF 1
 #define PROPAGATE_REPL 2
+/* With PROPAGATE_REPL: keep it out of multi-master RREPLAY forwarding. Used for
+ * expiry deletes, which every node performs on its own from the absolute TTL;
+ * forwarded with a fresh HLC they would delete a concurrent newer write. */
+#define PROPAGATE_NO_RREPLAY 4
 
 /* Actions pause types */
 #define PAUSE_ACTION_CLIENT_WRITE (1 << 0)

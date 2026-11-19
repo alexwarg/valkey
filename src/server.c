@@ -3614,6 +3614,7 @@ bool clientSupportStandAloneRedirect(client *c) {
 
 static int shouldForwardToPrimaryViaRReplay(int target) {
     if (!(target & PROPAGATE_REPL)) return 0;
+    if (target & PROPAGATE_NO_RREPLAY) return 0;
     if (!server.active_replica || !server.multi_master) return 0;
     int has_primary = (server.primary_host != NULL && server.primary != NULL && server.repl_state == REPL_STATE_CONNECTED);
     int has_upstreams = (server.upstream_runtime && listLength(server.upstream_runtime) > 0);
