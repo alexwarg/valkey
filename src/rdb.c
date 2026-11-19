@@ -1439,6 +1439,190 @@ static int rdbSaveInfoEnsureHLCClockMap(rdbSaveInfo *rsi) {
     return rsi->hlc_key_clock != NULL ? C_OK : C_ERR;
 }
 
+/* Multi-master state: HLC clocks, peers, replay queues and RREPLAY dedupe IDs.
+ * Saved with the replication fields, and on its own by multi-master nodes that
+ * have no replication info to save (a primary without a backlog), since a
+ * snapshot merge and a restart both need it. */
+static int rdbSaveMultiMasterAuxFields(rio *rdb) {
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-wall", server.hlc_clock.wall_time) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-logical", server.hlc_clock.logical) == -1) return -1;
+    unsigned long upstream_count = server.upstreams ? listLength(server.upstreams) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-masters-count", upstream_count) == -1) return -1;
+    if (upstream_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long upstream_id = 0;
+
+        listRewind(server.upstreams, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            valkeyUpstream *upstream = listNodeValue(ln);
+            if (upstream == NULL || upstream->host == NULL) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "repl-master-%lu", upstream_id);
+            sds auxval = sdscatprintf(sdsempty(), "%s|%d", upstream->host, upstream->port);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+            upstream_id++;
+        }
+    }
+
+    unsigned long runtime_count = server.upstream_runtime ? listLength(server.upstream_runtime) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-count", runtime_count) == -1) return -1;
+    unsigned long runtime_pending_count = 0;
+    int runtime_pending_truncated = 0;
+    if (runtime_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long runtime_id = 0;
+
+        listRewind(server.upstream_runtime, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            if (runtime_id >= RDB_REPL_RUNTIME_MAX) break;
+            valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+            if (runtime == NULL || runtime->host == NULL) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "repl-runtime-%lu", runtime_id);
+            sds auxval = sdscatprintf(sdsempty(), "%s|%d|%llu|%llu|%llu|%llu|%llu",
+                                      runtime->host, runtime->port,
+                                      runtime->replay_last_sent_id, runtime->replay_last_acked_id,
+                                      runtime->replay_tx_frames, runtime->replay_rx_frames, runtime->replay_ack_frames);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+
+            if (runtime->replay_pending_frames) {
+                listIter pli;
+                listNode *pln;
+                listRewind(runtime->replay_pending_frames, &pli);
+                while ((pln = listNext(&pli)) != NULL) {
+                    if (runtime_pending_count >= RDB_REPL_RUNTIME_PENDING_MAX) {
+                        runtime_pending_truncated = 1;
+                        break;
+                    }
+                    rreplayPendingFrame *pending = listNodeValue(pln);
+                    if (pending == NULL || pending->replay_id == 0 || pending->frame == NULL) continue;
+
+                    sds pending_key = sdscatprintf(sdsempty(), "repl-runtime-pending-%lu", runtime_pending_count);
+                    uint64_t runtime_idx_be = htonu64((uint64_t)runtime_id);
+                    uint64_t replay_id_be = htonu64((uint64_t)pending->replay_id);
+                    sds pending_val = sdsnewlen(&runtime_idx_be, sizeof(runtime_idx_be));
+                    pending_val = sdscatlen(pending_val, &replay_id_be, sizeof(replay_id_be));
+                    pending_val = sdscatlen(pending_val, pending->frame, sdslen(pending->frame));
+                    rc = rdbSaveAuxField(rdb, pending_key, sdslen(pending_key), pending_val, sdslen(pending_val));
+                    sdsfree(pending_key);
+                    sdsfree(pending_val);
+                    if (rc == -1) return -1;
+                    runtime_pending_count++;
+                }
+            }
+            runtime_id++;
+        }
+
+        if (runtime_count > RDB_REPL_RUNTIME_MAX) {
+            serverLog(LL_WARNING,
+                      "Truncated MM runtime persistence to %d entries (had %lu)",
+                      RDB_REPL_RUNTIME_MAX, runtime_count);
+        }
+    }
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-pending-count", runtime_pending_count) == -1) return -1;
+    if (runtime_pending_truncated) {
+        serverLog(LL_WARNING,
+                  "Truncated MM runtime pending replay persistence to %d entries",
+                  RDB_REPL_RUNTIME_PENDING_MAX);
+    }
+
+    unsigned long hlc_count = server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "hlc-keys-count", hlc_count) == -1) return -1;
+    server.hlc_rdb_clock_entries_dropped_last_save = 0;
+    if (hlc_count) {
+        unsigned long cap = 0;
+        if (server.hlc_rdb_clock_max_entries > 0) {
+            unsigned long long configured_cap = (unsigned long long)server.hlc_rdb_clock_max_entries;
+            cap = configured_cap > ULONG_MAX ? ULONG_MAX : (unsigned long)configured_cap;
+        }
+
+        unsigned long heap_cap = min(cap, hlc_count);
+        hlcPersistEntry *heap = heap_cap ? zmalloc(sizeof(*heap) * heap_cap) : NULL;
+        unsigned long heap_size = 0;
+        unsigned long valid_entries = 0;
+
+        dictIterator di;
+        dictInitIterator(&di, server.hlc_key_clock);
+        dictEntry *de;
+
+        while ((de = dictNext(&di)) != NULL) {
+            sds hlc_key = dictGetKey(de);
+            hlc *clockp = dictGetVal(de);
+            if (hlc_key == NULL || clockp == NULL || (clockp->wall_time == 0 && clockp->logical == 0)) continue;
+            valid_entries++;
+
+            hlcPersistEntry candidate = {
+                .key = hlc_key,
+                .ts = *clockp,
+            };
+            hlcPersistHeapPushOrReplace(heap, &heap_size, heap_cap, candidate);
+        }
+
+        if (heap_size > 1) {
+            qsort(heap, heap_size, sizeof(*heap), hlcPersistEntrySortDesc);
+        }
+
+        for (unsigned long hlc_id = 0; hlc_id < heap_size; hlc_id++) {
+            uint64_t wall_be = htonu64(heap[hlc_id].ts.wall_time);
+            uint64_t logical_be = htonu64(heap[hlc_id].ts.logical);
+            sds auxkey = sdscatprintf(sdsempty(), "hlc-key-%lu", hlc_id);
+            sds auxval = sdsnewlen(&wall_be, sizeof(wall_be));
+            auxval = sdscatlen(auxval, &logical_be, sizeof(logical_be));
+            auxval = sdscatlen(auxval, heap[hlc_id].key, sdslen(heap[hlc_id].key));
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
+            sdsfree(auxkey);
+            sdsfree(auxval);
+            if (rc == -1) return -1;
+        }
+
+        if (valid_entries > heap_size) {
+            server.hlc_rdb_clock_entries_dropped_last_save = valid_entries - heap_size;
+            serverLog(LL_WARNING,
+                      "Truncated HLC clock persistence to %lu entries (had %lu valid)",
+                      heap_size, valid_entries);
+        }
+
+        if (heap) zfree(heap);
+    }
+
+    unsigned long replay_seen_count = server.rreplay_seen_order ? listLength(server.rreplay_seen_order) : 0;
+    if (rdbSaveAuxFieldStrInt(rdb, "rreplay-seen-count", replay_seen_count) == -1) return -1;
+    if (replay_seen_count) {
+        listIter li;
+        listNode *ln;
+        unsigned long replay_seen_id = 0;
+
+        listRewind(server.rreplay_seen_order, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            if (replay_seen_id >= RDB_RREPLAY_SEEN_MAX_ENTRIES) break;
+
+            sds dedup_key = listNodeValue(ln);
+            if (dedup_key == NULL || sdslen(dedup_key) == 0) continue;
+
+            sds auxkey = sdscatprintf(sdsempty(), "rreplay-seen-%lu", replay_seen_id);
+            int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), dedup_key, sdslen(dedup_key));
+            sdsfree(auxkey);
+            if (rc == -1) return -1;
+            replay_seen_id++;
+        }
+
+        if (replay_seen_count > RDB_RREPLAY_SEEN_MAX_ENTRIES) {
+            serverLog(LL_WARNING,
+                      "Truncated RREPLAY dedupe persistence to %d entries (had %lu)",
+                      RDB_RREPLAY_SEEN_MAX_ENTRIES, replay_seen_count);
+        }
+    }
+    return 1;
+}
+
 /* Save a few default AUX fields with information about the RDB generated. */
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void *) == 8) ? 64 : 32;
@@ -1455,182 +1639,11 @@ int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
         if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
         if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
         if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
-        if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-wall", server.hlc_clock.wall_time) == -1) return -1;
-        if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-logical", server.hlc_clock.logical) == -1) return -1;
-        unsigned long upstream_count = server.upstreams ? listLength(server.upstreams) : 0;
-        if (rdbSaveAuxFieldStrInt(rdb, "repl-masters-count", upstream_count) == -1) return -1;
-        if (upstream_count) {
-            listIter li;
-            listNode *ln;
-            unsigned long upstream_id = 0;
-
-            listRewind(server.upstreams, &li);
-            while ((ln = listNext(&li)) != NULL) {
-                valkeyUpstream *upstream = listNodeValue(ln);
-                if (upstream == NULL || upstream->host == NULL) continue;
-
-                sds auxkey = sdscatprintf(sdsempty(), "repl-master-%lu", upstream_id);
-                sds auxval = sdscatprintf(sdsempty(), "%s|%d", upstream->host, upstream->port);
-                int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
-                sdsfree(auxkey);
-                sdsfree(auxval);
-                if (rc == -1) return -1;
-                upstream_id++;
-            }
-        }
-
-        unsigned long runtime_count = server.upstream_runtime ? listLength(server.upstream_runtime) : 0;
-        if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-count", runtime_count) == -1) return -1;
-        unsigned long runtime_pending_count = 0;
-        int runtime_pending_truncated = 0;
-        if (runtime_count) {
-            listIter li;
-            listNode *ln;
-            unsigned long runtime_id = 0;
-
-            listRewind(server.upstream_runtime, &li);
-            while ((ln = listNext(&li)) != NULL) {
-                if (runtime_id >= RDB_REPL_RUNTIME_MAX) break;
-                valkeyUpstreamRuntime *runtime = listNodeValue(ln);
-                if (runtime == NULL || runtime->host == NULL) continue;
-
-                sds auxkey = sdscatprintf(sdsempty(), "repl-runtime-%lu", runtime_id);
-                sds auxval = sdscatprintf(sdsempty(), "%s|%d|%llu|%llu|%llu|%llu|%llu",
-                                          runtime->host, runtime->port,
-                                          runtime->replay_last_sent_id, runtime->replay_last_acked_id,
-                                          runtime->replay_tx_frames, runtime->replay_rx_frames, runtime->replay_ack_frames);
-                int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
-                sdsfree(auxkey);
-                sdsfree(auxval);
-                if (rc == -1) return -1;
-
-                if (runtime->replay_pending_frames) {
-                    listIter pli;
-                    listNode *pln;
-                    listRewind(runtime->replay_pending_frames, &pli);
-                    while ((pln = listNext(&pli)) != NULL) {
-                        if (runtime_pending_count >= RDB_REPL_RUNTIME_PENDING_MAX) {
-                            runtime_pending_truncated = 1;
-                            break;
-                        }
-                        rreplayPendingFrame *pending = listNodeValue(pln);
-                        if (pending == NULL || pending->replay_id == 0 || pending->frame == NULL) continue;
-
-                        sds pending_key = sdscatprintf(sdsempty(), "repl-runtime-pending-%lu", runtime_pending_count);
-                        uint64_t runtime_idx_be = htonu64((uint64_t)runtime_id);
-                        uint64_t replay_id_be = htonu64((uint64_t)pending->replay_id);
-                        sds pending_val = sdsnewlen(&runtime_idx_be, sizeof(runtime_idx_be));
-                        pending_val = sdscatlen(pending_val, &replay_id_be, sizeof(replay_id_be));
-                        pending_val = sdscatlen(pending_val, pending->frame, sdslen(pending->frame));
-                        rc = rdbSaveAuxField(rdb, pending_key, sdslen(pending_key), pending_val, sdslen(pending_val));
-                        sdsfree(pending_key);
-                        sdsfree(pending_val);
-                        if (rc == -1) return -1;
-                        runtime_pending_count++;
-                    }
-                }
-                runtime_id++;
-            }
-
-            if (runtime_count > RDB_REPL_RUNTIME_MAX) {
-                serverLog(LL_WARNING,
-                          "Truncated MM runtime persistence to %d entries (had %lu)",
-                          RDB_REPL_RUNTIME_MAX, runtime_count);
-            }
-        }
-        if (rdbSaveAuxFieldStrInt(rdb, "repl-runtime-pending-count", runtime_pending_count) == -1) return -1;
-        if (runtime_pending_truncated) {
-            serverLog(LL_WARNING,
-                      "Truncated MM runtime pending replay persistence to %d entries",
-                      RDB_REPL_RUNTIME_PENDING_MAX);
-        }
-
-        unsigned long hlc_count = server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0;
-        if (rdbSaveAuxFieldStrInt(rdb, "hlc-keys-count", hlc_count) == -1) return -1;
-        server.hlc_rdb_clock_entries_dropped_last_save = 0;
-        if (hlc_count) {
-            unsigned long cap = 0;
-            if (server.hlc_rdb_clock_max_entries > 0) {
-                unsigned long long configured_cap = (unsigned long long)server.hlc_rdb_clock_max_entries;
-                cap = configured_cap > ULONG_MAX ? ULONG_MAX : (unsigned long)configured_cap;
-            }
-
-            unsigned long heap_cap = min(cap, hlc_count);
-            hlcPersistEntry *heap = heap_cap ? zmalloc(sizeof(*heap) * heap_cap) : NULL;
-            unsigned long heap_size = 0;
-            unsigned long valid_entries = 0;
-
-            dictIterator di;
-            dictInitIterator(&di, server.hlc_key_clock);
-            dictEntry *de;
-
-            while ((de = dictNext(&di)) != NULL) {
-                sds hlc_key = dictGetKey(de);
-                hlc *clockp = dictGetVal(de);
-                if (hlc_key == NULL || clockp == NULL || (clockp->wall_time == 0 && clockp->logical == 0)) continue;
-                valid_entries++;
-
-                hlcPersistEntry candidate = {
-                    .key = hlc_key,
-                    .ts = *clockp,
-                };
-                hlcPersistHeapPushOrReplace(heap, &heap_size, heap_cap, candidate);
-            }
-
-            if (heap_size > 1) {
-                qsort(heap, heap_size, sizeof(*heap), hlcPersistEntrySortDesc);
-            }
-
-            for (unsigned long hlc_id = 0; hlc_id < heap_size; hlc_id++) {
-                uint64_t wall_be = htonu64(heap[hlc_id].ts.wall_time);
-                uint64_t logical_be = htonu64(heap[hlc_id].ts.logical);
-                sds auxkey = sdscatprintf(sdsempty(), "hlc-key-%lu", hlc_id);
-                sds auxval = sdsnewlen(&wall_be, sizeof(wall_be));
-                auxval = sdscatlen(auxval, &logical_be, sizeof(logical_be));
-                auxval = sdscatlen(auxval, heap[hlc_id].key, sdslen(heap[hlc_id].key));
-                int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), auxval, sdslen(auxval));
-                sdsfree(auxkey);
-                sdsfree(auxval);
-                if (rc == -1) return -1;
-            }
-
-            if (valid_entries > heap_size) {
-                server.hlc_rdb_clock_entries_dropped_last_save = valid_entries - heap_size;
-                serverLog(LL_WARNING,
-                          "Truncated HLC clock persistence to %lu entries (had %lu valid)",
-                          heap_size, valid_entries);
-            }
-
-            if (heap) zfree(heap);
-        }
-
-        unsigned long replay_seen_count = server.rreplay_seen_order ? listLength(server.rreplay_seen_order) : 0;
-        if (rdbSaveAuxFieldStrInt(rdb, "rreplay-seen-count", replay_seen_count) == -1) return -1;
-        if (replay_seen_count) {
-            listIter li;
-            listNode *ln;
-            unsigned long replay_seen_id = 0;
-
-            listRewind(server.rreplay_seen_order, &li);
-            while ((ln = listNext(&li)) != NULL) {
-                if (replay_seen_id >= RDB_RREPLAY_SEEN_MAX_ENTRIES) break;
-
-                sds dedup_key = listNodeValue(ln);
-                if (dedup_key == NULL || sdslen(dedup_key) == 0) continue;
-
-                sds auxkey = sdscatprintf(sdsempty(), "rreplay-seen-%lu", replay_seen_id);
-                int rc = rdbSaveAuxField(rdb, auxkey, sdslen(auxkey), dedup_key, sdslen(dedup_key));
-                sdsfree(auxkey);
-                if (rc == -1) return -1;
-                replay_seen_id++;
-            }
-
-            if (replay_seen_count > RDB_RREPLAY_SEEN_MAX_ENTRIES) {
-                serverLog(LL_WARNING,
-                          "Truncated RREPLAY dedupe persistence to %d entries (had %lu)",
-                          RDB_RREPLAY_SEEN_MAX_ENTRIES, replay_seen_count);
-            }
-        }
+        if (rdbSaveMultiMasterAuxFields(rdb) == 1) return -1;
+    } else if (server.multi_master) {
+        /* A forkless socket save also writes these fields in its tail; the
+         * loader keeps the later copy. */
+        if (rdbSaveMultiMasterAuxFields(rdb) == -1) return -1;
     }
     if (rdbSaveAuxFieldStrInt(rdb, "aof-base", aof_base) == -1) return -1;
 
@@ -3976,6 +3989,10 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             sdsfree(key);
             decrRefCount(val);
             server.rdb_last_load_keys_expired++;
+        } else if ((rdbflags & RDBFLAGS_MERGE_HLC) && rsi && !replicationMergeSnapshotKey(db, key, val, rsi)) {
+            /* Snapshot merge: the local copy of this key wins. */
+            sdsfree(key);
+            decrRefCount(val);
         } else {
             robj keyobj;
             initStaticStringObject(keyobj, key);
@@ -3984,10 +4001,11 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             int added = dbAddRDBLoad(db, key, &val);
             server.rdb_last_load_keys_loaded++;
             if (!added) {
-                if (rdbflags & RDBFLAGS_ALLOW_DUP) {
+                if (rdbflags & (RDBFLAGS_ALLOW_DUP | RDBFLAGS_MERGE_HLC)) {
                     /* This flag is useful for DEBUG RELOAD special modes.
                      * When it's set we allow new keys to replace the current
-                     * keys with the same name. */
+                     * keys with the same name. A snapshot merge only gets
+                     * here when the snapshot value won. */
                     dbSyncDelete(db, &keyobj);
                     added = dbAddRDBLoad(db, key, &val);
                     serverAssert(added);
