@@ -17,14 +17,33 @@ start_server {overrides {save {}}} {
         $n config set replica-read-only no
     }
 
-    test {3-node chain converges with active-replica and no-forward enabled} {
+    # Take every node out of the mesh and empty it. A node that still lists a
+    # peer re-adds itself there when its link reconnects, so repeat the
+    # removes until no node has a peer left.
+    proc reset_mesh {nodes} {
+        wait_for_condition 50 200 {
+            [mesh_removed $nodes]
+        } else {
+            fail "mesh was not torn down"
+        }
+        foreach n $nodes { catch {$n flushall} }
+    }
+
+    proc mesh_removed {nodes} {
+        foreach n $nodes { catch {$n multimaster remove} }
+        after 100
+        return [expr {[s -2 configured_upstreams] == 0 &&
+                      [s -1 configured_upstreams] == 0 &&
+                      [s 0 configured_upstreams] == 0}]
+    }
+
+    test {3-node chain converges with no-forward enabled} {
+        # Chain of peer links: A - B - C.
         $nodeB multimaster add $nodeA_host $nodeA_port
-        $nodeC replicaof $nodeB_host $nodeB_port
-        # nodeB uses multimaster (no traditional primary link), check nodeA's upstream runtime link
-        # and nodeC's standard replicaof link
+        $nodeC multimaster add $nodeB_host $nodeB_port
         wait_for_condition 100 100 {
             [s -2 active_upstream_runtime_links] >= 1 &&
-            [s 0 master_link_status] eq {up}
+            [s 0 active_upstream_runtime_links] >= 1
         } else {
             fail "chain links were not established"
         }
@@ -56,13 +75,7 @@ start_server {overrides {save {}}} {
     }
 
     test {3-node failover between configured upstreams} {
-        foreach n [list $nodeA $nodeB $nodeC] {
-            $n replicaof no one
-            $n flushall
-            $n config set active-replica yes
-            $n config set multi-master yes
-            $n config set replica-read-only no
-        }
+        reset_mesh [list $nodeA $nodeB $nodeC]
 
         $nodeB multimaster add $nodeA_host $nodeA_port
         $nodeB multimaster add $nodeC_host $nodeC_port
@@ -93,13 +106,7 @@ start_server {overrides {save {}}} {
     }
 
     test {3-node full mesh survives churn and converges} {
-        foreach n [list $nodeA $nodeB $nodeC] {
-            $n replicaof no one
-            $n flushall
-            $n config set active-replica yes
-            $n config set multi-master yes
-            $n config set replica-read-only no
-        }
+        reset_mesh [list $nodeA $nodeB $nodeC]
 
         $nodeA multimaster add $nodeB_host $nodeB_port
         $nodeA multimaster add $nodeC_host $nodeC_port
@@ -172,13 +179,7 @@ start_server {overrides {save {}}} {
 
 if {0} {
     test {3-node queued replay drains after peer reconnect} {
-        foreach n [list $nodeA $nodeB $nodeC] {
-            $n replicaof no one
-            $n flushall
-            $n config set active-replica yes
-            $n config set multi-master yes
-            $n config set replica-read-only no
-        }
+        reset_mesh [list $nodeA $nodeB $nodeC]
 
         $nodeA multimaster add $nodeB_host $nodeB_port
         $nodeA multimaster add $nodeC_host $nodeC_port
@@ -273,13 +274,7 @@ if {0} {
             set nodeC_host [srv 0 host]
             set nodeC_port [srv 0 port]
         }
-        foreach n [list $nodeA $nodeB $nodeC] {
-            catch {$n replicaof no one}
-            catch {$n flushall}
-            catch {$n config set active-replica yes}
-            catch {$n config set multi-master yes}
-            catch {$n config set replica-read-only no}
-        }
+        reset_mesh [list $nodeA $nodeB $nodeC]
 
         $nodeA multimaster add $nodeB_host $nodeB_port
         $nodeA multimaster add $nodeC_host $nodeC_port

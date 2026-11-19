@@ -105,5 +105,50 @@ start_server {overrides {save {} active-replica yes multi-master yes}} {
         restart_server 0 true false
         assert_equal $entries [s 0 hlc_key_clock_entries]
     }
+
+    proc wait_merge_done {} {
+        wait_for_condition 100 100 {
+            [s 0 multi_master_merge_in_progress] == 0
+        } else {
+            fail "MULTIMASTER MERGE did not finish"
+        }
+    }
+
+    test "MULTIMASTER MERGE fetches a peer snapshot and merges it" {
+        set A [srv 0 client]
+        set_with_clock $B k:net-snap snap 900
+        set_with_clock $A k:net-local local 900
+        set_with_clock $A k:net-newer-local local 200
+        set_with_clock $B k:net-newer-local snap 100
+
+        assert_equal OK [$A multimaster merge [srv -1 host] [srv -1 port]]
+        wait_merge_done
+        assert_equal ok [s 0 multi_master_merge_last_status]
+        assert {[s 0 multi_master_merge_last_changes] >= 1}
+
+        assert_equal snap [$A get k:net-snap]
+        assert_equal local [$A get k:net-local]
+        assert_equal local [$A get k:net-newer-local]
+        # Nobody changed role, and the rdb-only link is gone.
+        assert_equal master [s 0 role]
+        assert_equal master [s -1 role]
+        wait_for_condition 50 100 {
+            [s -1 connected_slaves] == 0
+        } else {
+            fail "rdb-only snapshot link stayed connected"
+        }
+    }
+
+    test "MULTIMASTER MERGE reports a failure for an unreachable peer" {
+        set A [srv 0 client]
+        set port [find_available_port $::baseport $::portcount]
+        assert_equal OK [$A multimaster merge 127.0.0.1 $port]
+        wait_merge_done
+        assert_equal err [s 0 multi_master_merge_last_status]
+    }
+
+    test "MULTIMASTER MERGE refuses this node itself" {
+        assert_error {*itself*} {[srv 0 client] multimaster merge [srv 0 host] [srv 0 port]}
+    }
 }
 }

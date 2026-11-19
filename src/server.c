@@ -2388,6 +2388,9 @@ void initServerConfig(void) {
     server.active_replica = 0;
     server.multi_master = 0;
     server.multi_master_no_forward = 0;
+    server.mm_merge_in_progress = 0;
+    server.mm_merge_last_status = -1;
+    server.mm_merge_last_changes = 0;
     server.rreplay_seen = NULL;
     server.rreplay_seen_order = NULL;
     server.rreplay_seq = 0;
@@ -6730,6 +6733,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "active_replica:%d\r\n", server.active_replica,
                 "multi_master:%d\r\n", server.multi_master,
                 "multi_master_no_forward:%d\r\n", server.multi_master_no_forward,
+                "multi_master_merge_in_progress:%d\r\n", server.mm_merge_in_progress,
+                "multi_master_merge_last_status:%s\r\n",
+                server.mm_merge_last_status < 0 ? "none" : (server.mm_merge_last_status ? "ok" : "err"),
+                "multi_master_merge_last_changes:%lld\r\n", server.mm_merge_last_changes,
                 "master_global_link_status:%s\r\n", master_global_link_status,
                 "connected_masters:%d\r\n", connected_masters,
                 "configured_upstreams:%lu\r\n", server.upstreams ? listLength(server.upstreams) : 0,
