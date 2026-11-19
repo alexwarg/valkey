@@ -980,6 +980,11 @@ bool timestampIsExpired(mstime_t when) {
 expirationPolicy getExpirationPolicyWithFlags(int flags) {
     if (server.loading) return POLICY_IGNORE_EXPIRE;
 
+    /* Multi-master replay is applied like a primary's stream: the origin
+     * already replicated any expiry it performed. Expiring here would emit
+     * an UNLINK with a newer HLC than the write being replayed. */
+    if (isApplyingRReplay()) return POLICY_IGNORE_EXPIRE;
+
     /* If we are running in the context of a replica, instead of
      * evicting the expired key from the database, we return ASAP:
      * the replica key expiration is controlled by the primary that will
