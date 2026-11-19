@@ -3546,6 +3546,7 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 int prepareReplicasToWrite(void);
 void replicationFeedReplicas(int dictid, robj **argv, int argc);
 void replicationFeedPrimaryWithRReplay(int dictid, robj **argv, int argc);
+int isApplyingRReplay(void);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
 void replicationDetachUpstreamRuntimeClient(client *c);
