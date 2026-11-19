@@ -7943,6 +7943,8 @@ void loadDataFromDisk(void) {
         if (ret == AOF_FAILED || ret == AOF_OPEN_ERR) exit(1);
         if (ret != AOF_NOT_EXIST)
             serverLog(LL_NOTICE, "DB loaded from append only file: %.3f seconds", (float)(ustime() - start) / 1000000);
+        /* No RDB AUX fields here; restore multi-master peers from the local state file. */
+        replicationApplyRdbConfiguredUpstreams(NULL);
     } else {
         rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
         int rsi_is_valid = 0;
@@ -7993,7 +7995,10 @@ void loadDataFromDisk(void) {
                     server.repl_no_replicas_since = time(NULL);
                 }
             }
-        } else if (rdb_load_ret != RDB_NOT_EXIST) {
+        } else if (rdb_load_ret == RDB_NOT_EXIST) {
+            /* No RDB yet; restore multi-master peers from the local state file. */
+            replicationApplyRdbConfiguredUpstreams(NULL);
+        } else {
             serverLog(LL_WARNING, "Fatal error loading the DB, check server logs. Exiting.");
             exit(1);
         }
