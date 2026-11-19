@@ -1801,6 +1801,8 @@ typedef struct valkeyUpstreamRuntime {
     unsigned long long replay_fullsync_requests; /* Total peer full-sync requests sent after queue overflow. */
     int replay_fullsync_required; /* 1 when queue overflow requires peer full-sync before incremental replay. */
     list *replay_pending_frames; /* Pending outbound replay frames awaiting ACK on peer-forward links. */
+    int merge_needed;            /* A snapshot merge from this peer is still needed; frames from it are refused. */
+    time_t merge_next_attempt;   /* Earliest time for the next merge attempt. */
 } valkeyUpstreamRuntime;
 
 /* This structure can be optionally passed to RDB save/load functions in
@@ -3557,6 +3559,8 @@ int isApplyingRReplay(void);
 void replicationMergeSnapshotBegin(void);
 int replicationMergeSnapshotKey(serverDb *db, sds key, robj *val, rdbSaveInfo *rsi);
 long long replicationMergeSnapshotFinish(rdbSaveInfo *rsi);
+void replicationScheduleStartupMerges(void);
+int replicationMergePendingPeers(void);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
 void replicationDetachUpstreamRuntimeClient(client *c);
