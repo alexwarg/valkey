@@ -1951,41 +1951,6 @@ long long getExpire(serverDb *db, robj *key) {
     return getExpireWithDictIndex(db, key, dict_index);
 }
 
-static void propagateExpiredDeletion(serverDb *db, robj *key, int lazy, int slot);
-
-void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
-    mstime_t expire_latency;
-    latencyStartMonitor(expire_latency);
-    dbGenericDeleteWithDictIndex(db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED, dict_index);
-    latencyEndMonitor(expire_latency);
-    latencyAddSampleIfNeeded("expire-del", expire_latency);
-    latencyTraceIfNeeded(db, expire_del, expire_latency);
-    notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
-    signalModifiedKey(NULL, db, keyobj);
-    propagateExpiredDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
-    server.stat_expiredkeys++;
-}
-
-/* Delete the specified expired key and propagate expire. */
-void deleteExpiredKeyAndPropagate(serverDb *db, robj *keyobj) {
-    int dict_index = getKVStoreIndexForKey(objectGetVal(keyobj));
-    deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, dict_index);
-}
-
-/* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
-void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
-    int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
-    serverAssertWithInfo(c, keyobj, deleted);
-    server.dirty++;
-
-    /* Replicate/AOF this as an explicit DEL or UNLINK. */
-    robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
-    rewriteClientCommandVector(c, 2, aux, keyobj);
-    signalModifiedKey(c, c->db, keyobj);
-    notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, c->db->id);
-    server.stat_expiredkeys++;
-}
-
 /* Propagate an implicit key deletion into replicas and the AOF file.
  * When a key was deleted in the primary by eviction, expiration or a similar
  * mechanism a DEL/UNLINK operation for this key is sent
@@ -2027,6 +1992,44 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
  * multi-master peers, which expire the key themselves (PROPAGATE_NO_RREPLAY). */
 static void propagateExpiredDeletion(serverDb *db, robj *key, int lazy, int slot) {
     propagateDeletionWithTarget(db, key, lazy, slot, PROPAGATE_AOF | PROPAGATE_REPL | PROPAGATE_NO_RREPLAY);
+}
+
+/* Delete the specified expired key and propagate expire.
+ *
+ * This function does not incr the dirty counter since we don't want to
+ * propagate the read command on lazy expire. Caller needs to increment
+ * it themselves if necessary. */
+void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
+    mstime_t expire_latency;
+    latencyStartMonitor(expire_latency);
+    dbGenericDeleteWithDictIndex(db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED, dict_index);
+    latencyEndMonitor(expire_latency);
+    latencyAddSampleIfNeeded("expire-del", expire_latency);
+    latencyTraceIfNeeded(db, expire_del, expire_latency);
+    notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
+    signalModifiedKey(NULL, db, keyobj);
+    propagateExpiredDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
+    server.stat_expiredkeys++;
+}
+
+/* Delete the specified expired key and propagate expire. */
+void deleteExpiredKeyAndPropagate(serverDb *db, robj *keyobj) {
+    int dict_index = getKVStoreIndexForKey(objectGetVal(keyobj));
+    deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, dict_index);
+}
+
+/* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
+void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
+    int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
+    serverAssertWithInfo(c, keyobj, deleted);
+    server.dirty++;
+
+    /* Replicate/AOF this as an explicit DEL or UNLINK. */
+    robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
+    rewriteClientCommandVector(c, 2, aux, keyobj);
+    signalModifiedKey(c, c->db, keyobj);
+    notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, c->db->id);
+    server.stat_expiredkeys++;
 }
 
 #define EXPIRE_BULK_LIMIT ((size_t)1024) /* Maximum number of fields to active-expire (per replicated HDEL command */
