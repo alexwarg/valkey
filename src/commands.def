@@ -8529,12 +8529,13 @@ struct COMMAND_ARG MULTIMASTER_args_merge_host_port_Subargs[] = {
 struct COMMAND_ARG MULTIMASTER_args_Subargs[] = {
 {MAKE_ARG("host-port",ARG_TYPE_BLOCK,-1,NULL,NULL,NULL,CMD_ARG_NONE,2,NULL),.subargs=MULTIMASTER_args_host_port_Subargs},
 {MAKE_ARG("add-host-port",ARG_TYPE_BLOCK,-1,NULL,NULL,NULL,CMD_ARG_NONE,3,NULL),.subargs=MULTIMASTER_args_add_host_port_Subargs},
+{MAKE_ARG("merge-request",ARG_TYPE_PURE_TOKEN,-1,"MERGE-REQUEST",NULL,NULL,CMD_ARG_NONE,0,NULL)},
 {MAKE_ARG("merge-host-port",ARG_TYPE_BLOCK,-1,NULL,NULL,NULL,CMD_ARG_NONE,3,NULL),.subargs=MULTIMASTER_args_merge_host_port_Subargs},
 };
 
 /* MULTIMASTER argument table */
 struct COMMAND_ARG MULTIMASTER_Args[] = {
-{MAKE_ARG("args",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_NONE,3,NULL),.subargs=MULTIMASTER_args_Subargs},
+{MAKE_ARG("args",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_NONE,4,NULL),.subargs=MULTIMASTER_args_Subargs},
 {MAKE_ARG("remove",ARG_TYPE_PURE_TOKEN,-1,"REMOVE",NULL,NULL,CMD_ARG_NONE,0,NULL)},
 };
 

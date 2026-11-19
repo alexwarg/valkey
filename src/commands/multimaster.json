@@ -46,6 +46,11 @@
                         ]
                     },
                     {
+                        "name": "merge-request",
+                        "type": "pure-token",
+                        "token": "MERGE-REQUEST"
+                    },
+                    {
                         "name": "merge-host-port",
                         "type": "block",
                         "arguments": [

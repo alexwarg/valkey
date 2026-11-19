@@ -234,6 +234,20 @@ static valkeyUpstreamRuntime *findUpstreamRuntimeByLinkClient(const client *link
     return NULL;
 }
 
+/* The runtime of the peer that sends on 'c', known once the peer's self-ADD
+ * arrived on that connection (MULTIMASTER ADD handshake). */
+static valkeyUpstreamRuntime *findUpstreamRuntimeByIncomingClient(const client *c) {
+    if (server.upstream_runtime == NULL || c == NULL) return NULL;
+    listIter li;
+    listNode *ln;
+    listRewind(server.upstream_runtime, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+        if (runtime && runtime->incoming_client == c) return runtime;
+    }
+    return NULL;
+}
+
 static int upstreamRuntimeSupportsReplayQueue(const valkeyUpstreamRuntime *runtime) {
     if (runtime == NULL) return 0;
     return !upstreamRuntimeIsCurrentPrimary(runtime);
@@ -476,6 +490,8 @@ static valkeyUpstreamRuntime *ensureUpstreamRuntimeEntry(const char *host, int p
     runtime->replay_pending_dropped = 0;
     runtime->replay_fullsync_requests = 0;
     runtime->replay_fullsync_required = 0;
+    runtime->merge_needed = 0;
+    runtime->merge_next_attempt = 0;
     runtime->replay_pending_frames = listCreate();
     if (runtime->replay_pending_frames) {
         runtime->replay_pending_frames->free = freeRReplayPendingFrame;
@@ -560,6 +576,21 @@ static void queueUpstreamForwardCommand(client *c, int argc, const char **argv, 
         size_t arglen = argv_lens ? argv_lens[i] : strlen(argv[i]);
         addReplyBulkCBuffer(c, argv[i], arglen);
     }
+}
+
+/* Our replay queue for this peer overflowed, so frames were dropped. Ask the
+ * peer to merge our snapshot (which covers them) and resume replay: frames
+ * from here on are queued and sent again. The peer holds our frames until its
+ * merge from us has finished. */
+static void upstreamRuntimeRequestMerge(valkeyUpstreamRuntime *runtime) {
+    if (runtime == NULL || runtime->link_client == NULL || !runtime->replay_fullsync_required) return;
+    const char *argv[] = {"MULTIMASTER", "MERGE-REQUEST"};
+    size_t argv_lens[] = {11, 13};
+    queueUpstreamForwardCommand(runtime->link_client, 2, argv, argv_lens);
+    runtime->replay_fullsync_required = 0;
+    runtime->replay_fullsync_requests++;
+    serverLog(LL_WARNING, "Replay queue for multi-master peer %s:%d overflowed, asked the peer to merge our snapshot",
+              runtime->host ? runtime->host : "?", runtime->port);
 }
 
 static void queueUpstreamForwardHandshake(client *c) {
@@ -723,6 +754,9 @@ static void connectConfiguredUpstreamForwardLink(connection *conn) {
         ln = next;
     }
 
+    /* After the handshake, so the peer already knows which runtime this link
+     * belongs to. */
+    upstreamRuntimeRequestMerge(runtime);
     upstreamRuntimeFlushPendingReplayQueue(runtime);
     serverLog(LL_NOTICE, "Connected multi-master peer forwarding link to %s:%d", runtime->host, runtime->port);
 }
@@ -834,6 +868,10 @@ void replicationDetachUpstreamRuntimeClient(client *c) {
         runtime->replybuf = NULL;
     }
     runtime->link_client = NULL;
+    /* Frames sent on this link may never have been applied (e.g. refused
+     * while the peer merges): resend all unacknowledged ones on reconnect.
+     * Duplicates are dropped by the peer's RREPLAY dedupe. */
+    upstreamRuntimeMarkPendingReplayFramesForResend(runtime);
 
     if (runtime->incoming_client == c) {
         runtime->incoming_client = NULL;
@@ -2438,7 +2476,15 @@ static int fanoutRReplayFrameToUpstreams(const sds frame, unsigned long long rep
             valkeyUpstreamRuntime *runtime = listNodeValue(ln);
             if (runtime == NULL) continue;
             if (exclude != NULL && runtime->link_client == exclude) continue;
-            if (runtime->replay_fullsync_required) continue;
+            if (runtime->replay_fullsync_required) {
+                /* Without a link the request goes out on reconnect, and the
+                 * merge it triggers covers this frame. */
+                if (runtime->link_client == NULL || runtime->link_client->conn == NULL ||
+                    connGetState(runtime->link_client->conn) != CONN_STATE_CONNECTED) {
+                    continue;
+                }
+                upstreamRuntimeRequestMerge(runtime);
+            }
 
             rreplayPendingFrame *queued_entry = NULL;
             if (queue_if_disconnected && replay_id > 0) {
@@ -3597,6 +3643,19 @@ void rreplayCommand(client *c) {
     if (!from_primary_link && !from_replica_link && !from_peer_link) {
         addReplyError(c, "RREPLAY is only accepted from replication or peer-forward links");
         return;
+    }
+
+    /* Until a snapshot merge from this peer has finished, we may miss the base
+     * value its frames modify: an RPUSH applied to a missing key would create
+     * a partial value with a newer clock, which then beats the complete value
+     * in the merge. Refusing makes the sender drop the link and keep the frame
+     * queued; it is resent after the merge. */
+    if (from_peer_link) {
+        valkeyUpstreamRuntime *sender = findUpstreamRuntimeByIncomingClient(c);
+        if (sender && sender->merge_needed) {
+            addReplyError(c, "LOADING multi-master node is merging a snapshot from this peer");
+            return;
+        }
     }
 
     /* RREPLAY handles fan-out explicitly below; avoid auto-propagating the
@@ -6969,10 +7028,22 @@ static struct {
     time_t last_io;
 } mm_merge = {.state = MM_MERGE_IDLE, .fd = -1};
 
+/* Seconds between attempts to merge from a peer that could not serve one. */
+#define MM_MERGE_RETRY_DELAY 2
+
 static void mmMergeEnd(int ok, const char *reason) {
     if (!ok) {
         serverLog(LL_WARNING, "MULTIMASTER MERGE from %s:%d failed: %s", mm_merge.host ? mm_merge.host : "?",
                   mm_merge.port, reason);
+    }
+    listNode *rln = mm_merge.host ? findUpstreamRuntimeNode(mm_merge.host, mm_merge.port) : NULL;
+    if (rln) {
+        valkeyUpstreamRuntime *runtime = listNodeValue(rln);
+        if (ok) {
+            runtime->merge_needed = 0;
+        } else {
+            runtime->merge_next_attempt = server.unixtime + MM_MERGE_RETRY_DELAY;
+        }
     }
     if (mm_merge.conn) connClose(mm_merge.conn);
     if (mm_merge.fd != -1) close(mm_merge.fd);
@@ -7159,11 +7230,66 @@ static int mmMergeStart(const char *host, int port, const char **err) {
     return C_OK;
 }
 
-/* Called from replicationCron(): abort a merge whose peer went silent. */
+/* Called from replicationCron(): abort a merge whose peer went silent, and
+ * start the next merge a peer still needs (startup, replay queue overflow).
+ * One merge runs at a time; a failed one is retried. */
 static void mmMergeCron(void) {
-    if (mm_merge.state != MM_MERGE_IDLE && server.unixtime - mm_merge.last_io > server.repl_timeout) {
-        mmMergeEnd(0, "timeout");
+    if (mm_merge.state != MM_MERGE_IDLE) {
+        if (server.unixtime - mm_merge.last_io > server.repl_timeout) mmMergeEnd(0, "timeout");
+        return;
     }
+    if (!server.multi_master || server.upstream_runtime == NULL || server.loading) return;
+
+    listIter li;
+    listNode *ln;
+    listRewind(server.upstream_runtime, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+        if (runtime == NULL || !runtime->merge_needed || runtime->host == NULL) continue;
+        if (server.unixtime < runtime->merge_next_attempt) continue;
+        const char *err = NULL;
+        if (mmMergeStart(runtime->host, runtime->port, &err) != C_OK) {
+            /* Not retryable (e.g. the entry points at this node itself). */
+            serverLog(LL_WARNING, "Skipping merge from multi-master peer %s:%d: %s", runtime->host, runtime->port,
+                      err);
+            runtime->merge_needed = 0;
+            continue;
+        }
+        return;
+    }
+}
+
+/* Called after the dataset was loaded at startup: whatever this node has, its
+ * peers may hold writes it lost (written after its last save, or never
+ * received), so merge from every configured peer once. */
+void replicationScheduleStartupMerges(void) {
+    if (!server.multi_master || server.upstream_runtime == NULL) return;
+    int peers = 0;
+    listIter li;
+    listNode *ln;
+    listRewind(server.upstream_runtime, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+        if (runtime == NULL || runtime->host == NULL) continue;
+        runtime->merge_needed = 1;
+        runtime->merge_next_attempt = 0;
+        peers++;
+    }
+    if (peers) serverLog(LL_NOTICE, "Multi-master startup: merging snapshots from %d peer(s)", peers);
+}
+
+/* Number of peers whose snapshot still has to be merged (INFO). */
+int replicationMergePendingPeers(void) {
+    if (server.upstream_runtime == NULL) return 0;
+    int pending = 0;
+    listIter li;
+    listNode *ln;
+    listRewind(server.upstream_runtime, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        valkeyUpstreamRuntime *runtime = listNodeValue(ln);
+        if (runtime && runtime->merge_needed) pending++;
+    }
+    return pending;
 }
 
 /* multimaster command for active active replication */
@@ -7228,6 +7354,20 @@ void multimasterCommand(client *c) {
         addReply(c, shared.ok);
         return;
 
+    } else if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "merge-request")) {
+        /* Internal: sent on a peer link by a peer whose replay queue for us
+         * overflowed. Merge its snapshot, and hold its frames until then. */
+        valkeyUpstreamRuntime *runtime = findUpstreamRuntimeByIncomingClient(c);
+        if (runtime == NULL) {
+            addReplyError(c, "MULTIMASTER MERGE-REQUEST is only accepted on a multi-master peer link");
+            return;
+        }
+        serverLog(LL_NOTICE, "Multi-master peer %s:%d dropped replay frames for us, merging its snapshot",
+                  runtime->host, runtime->port);
+        runtime->merge_needed = 1;
+        runtime->merge_next_attempt = 0;
+        addReply(c, shared.ok);
+        return;
     } else if (c->argc == 4 && !strcasecmp(objectGetVal(c->argv[1]), "merge")) {
         /* MULTIMASTER MERGE host port: merge the peer's snapshot into the
          * dataset by per-key HLC. Runs in the background; INFO replication
