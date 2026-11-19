@@ -1613,6 +1613,128 @@ void replicationHLCSetKeyClock(int dbid, robj *key, hlc ts) {
     hlcSetKeyTieBreak(dbid, key, NULL);
 }
 
+/* ---------------------- Snapshot merge (RDBFLAGS_MERGE_HLC) ----------------------
+ * Loads a peer snapshot on top of the local dataset. Each key resolves by
+ * last-write-wins on its HLC clock; equal clocks resolve by comparing the DUMP
+ * payloads so every node picks the same winner. Clocks kept for deleted keys
+ * act as tombstones on both sides. */
+
+/* Keys changed by the merge in progress. */
+static long long mm_merge_changes = 0;
+
+void replicationMergeSnapshotBegin(void) {
+    mm_merge_changes = 0;
+}
+
+static int mergeComparePayloads(int dbid, robj *key, robj *a, robj *b) {
+    rio ra, rb;
+    rioInitWithBuffer(&ra, sdsempty());
+    rioInitWithBuffer(&rb, sdsempty());
+    createDumpPayload(&ra, a, key, dbid);
+    createDumpPayload(&rb, b, key, dbid);
+    sds pa = ra.io.buffer.ptr, pb = rb.io.buffer.ptr;
+    size_t la = sdslen(pa), lb = sdslen(pb);
+    int cmp = memcmp(pa, pb, la < lb ? la : lb);
+    if (cmp == 0) cmp = (la > lb) - (la < lb);
+    sdsfree(pa);
+    sdsfree(pb);
+    return cmp;
+}
+
+/* Called by the RDB loader for each snapshot key, before it is added. Returns
+ * 1 when the snapshot value must replace (or create) the local key. The key's
+ * snapshot clock is removed from rsi to mark it seen, so the entries left after
+ * the load are snapshot tombstones (see replicationMergeSnapshotFinish). */
+int replicationMergeSnapshotKey(serverDb *db, sds key, robj *val, rdbSaveInfo *rsi) {
+    robj keyobj;
+    initStaticStringObject(keyobj, key);
+
+    hlc remote = {0, 0};
+    if (rsi->hlc_key_clock) {
+        sds ckey = hlcComposeKey(db->id, &keyobj);
+        dictEntry *de = dictFind(rsi->hlc_key_clock, ckey);
+        if (de) {
+            remote = *(hlc *)dictGetVal(de);
+            dictDelete(rsi->hlc_key_clock, ckey);
+        }
+        sdsfree(ckey);
+    }
+    hlc local = replicationHLCGetKeyClock(db->id, &keyobj);
+    int cmp = hlcCompare(&remote, &local);
+    robj *current = dbFind(db, key);
+
+    int take;
+    if (current == NULL) {
+        /* Absent locally: add it unless a local tombstone is at least as new.
+         * With no clock on either side there is nothing to contradict it. */
+        take = cmp > 0 || (local.wall_time == 0 && local.logical == 0);
+    } else if (cmp != 0) {
+        take = cmp > 0;
+    } else {
+        take = mergeComparePayloads(db->id, &keyobj, val, current) > 0;
+    }
+
+    replicationHLCSetKeyClock(db->id, &keyobj, remote);
+    if (take) mm_merge_changes++;
+    return take;
+}
+
+/* Called after a successful merge load. Applies the snapshot tombstones left
+ * in rsi, merges the global clock and the RREPLAY dedupe IDs, and makes sure
+ * ordinary replicas and the AOF pick up the changed dataset. Returns the
+ * number of keys changed by the whole merge. */
+long long replicationMergeSnapshotFinish(rdbSaveInfo *rsi) {
+    if (rsi->hlc_key_clock) {
+        dictIterator di;
+        dictInitIterator(&di, rsi->hlc_key_clock);
+        dictEntry *de;
+        while ((de = dictNext(&di)) != NULL) {
+            sds ckey = dictGetKey(de);
+            hlc *remote = dictGetVal(de);
+            if (remote == NULL || sdslen(ckey) < sizeof(uint64_t)) continue;
+
+            uint64_t dbid_be;
+            memcpy(&dbid_be, ckey, sizeof(dbid_be));
+            uint64_t dbid = ntohu64(dbid_be);
+            if (dbid >= (uint64_t)server.dbnum) continue;
+
+            robj *keyobj = createStringObject(ckey + sizeof(uint64_t), sdslen(ckey) - sizeof(uint64_t));
+            hlc local = replicationHLCGetKeyClock((int)dbid, keyobj);
+            if (hlcCompare(remote, &local) > 0) {
+                serverDb *db = server.db[dbid];
+                if (db && dbFind(db, objectGetVal(keyobj)) && dbSyncDelete(db, keyobj)) mm_merge_changes++;
+                replicationHLCSetKeyClock((int)dbid, keyobj, *remote);
+            }
+            decrRefCount(keyobj);
+        }
+        dictResetIterator(&di);
+    }
+
+    /* Same drift guard as a regular RDB restore. */
+    uint64_t now = ustime();
+    if (hlcCompare(&rsi->hlc_clock, &server.hlc_clock) > 0 &&
+        (server.hlc_max_clock_drift <= 0 || rsi->hlc_clock.wall_time <= now + (uint64_t)server.hlc_max_clock_drift)) {
+        server.hlc_clock = rsi->hlc_clock;
+    }
+    replicationApplyRdbRReplaySeen(rsi);
+
+    long long changes = mm_merge_changes;
+    mm_merge_changes = 0;
+    if (changes > 0) {
+        server.dirty += changes;
+        /* The replication stream does not carry merged changes: make ordinary
+         * replicas full-sync instead of continuing with a stale dataset. */
+        if (listLength(server.replicas) > 0) {
+            changeReplicationId();
+            clearReplicationId2();
+            disconnectReplicas();
+        }
+        if (server.aof_state == AOF_ON) rewriteAppendOnlyFileBackground();
+    }
+    serverLog(LL_NOTICE, "Multi-master snapshot merge changed %lld keys", changes);
+    return changes;
+}
+
 static int hlcCommandIsFresh(struct serverCommand *cmd, robj **argv, int argc, int dbid, hlc ts, const char *tie_break) {
     if ((ts.wall_time == 0 && ts.logical == 0) || dbid < 0 || cmd == NULL) return 1;
 
