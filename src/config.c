@@ -621,6 +621,15 @@ void loadServerConfigFromString(sds config) {
         err = "replicaof directive not allowed in cluster mode";
         goto loaderr;
     }
+    /* Multi-master replaces primary/replica replication: nodes are peers. */
+    if (server.multi_master && server.cluster_enabled) {
+        err = "multi-master is not compatible with cluster mode";
+        goto loaderr;
+    }
+    if (server.multi_master && server.primary_host) {
+        err = "replicaof directive not allowed with multi-master; use MULTIMASTER ADD";
+        goto loaderr;
+    }
 
     /* To ensure backward compatibility and work while hz is out of range */
     if (server.hz < CONFIG_MIN_HZ) server.hz = CONFIG_MIN_HZ;
@@ -2384,8 +2393,8 @@ static void numericConfigRewrite(standardConfig *config, const char *name, struc
     }
 
 #define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn, applyfn) \
-    {.type = SPECIAL_CONFIG,                                                           \
-     embedCommonConfig(name, alias, modifiable) embedConfigInterface(NULL, setfn, getfn, rewritefn, applyfn)}
+    { .type = SPECIAL_CONFIG,                                                          \
+      embedCommonConfig(name, alias, modifiable) embedConfigInterface(NULL, setfn, getfn, rewritefn, applyfn) }
 
 static int isValidActiveDefrag(int val, const char **err) {
 #ifndef HAVE_DEFRAG
@@ -2536,6 +2545,16 @@ static int isValidActiveReplicaConfig(int val, const char **err) {
 static int isValidMultiMasterConfig(int val, const char **err) {
     if (val && !server.active_replica) {
         *err = "multi-master requires active-replica yes";
+        return 0;
+    }
+    /* Only checked at runtime: while the config file is read, these options
+     * may not be set yet (see the sanity checks in loadServerConfigFromString). */
+    if (val && !reading_config_file && server.cluster_enabled) {
+        *err = "multi-master is not compatible with cluster mode";
+        return 0;
+    }
+    if (val && !reading_config_file && server.primary_host) {
+        *err = "multi-master cannot be enabled on a replica; run REPLICAOF NO ONE first";
         return 0;
     }
     if (!val && server.multi_master_no_forward) {
@@ -3498,7 +3517,7 @@ standardConfig static_configs[] = {
     /* hlc-rdb-clock-max-entries controls the maximum number of persisted HLC key clocks in RDB AUX. */
     createLongLongConfig("hlc-rdb-clock-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.hlc_rdb_clock_max_entries, CONFIG_DEFAULT_HLC_RDB_CLOCK_MAX_ENTRIES, INTEGER_CONFIG, NULL, NULL),
     /* hlc-max-clock-drift is the maximum tolerated drift (in microseconds) between the HLC wall
-     * time and the local physical clock. 
+     * time and the local physical clock.
      * Set to 0 to disable checks. Default: 500 ms. */
     createLongLongConfig("hlc-max-clock-drift", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.hlc_max_clock_drift, CONFIG_DEFAULT_HLC_MAX_CLOCK_DRIFT_USEC, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("cluster-manual-failover-timeout", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.cluster_mf_timeout, 5000, INTEGER_CONFIG, NULL, NULL),

@@ -2322,12 +2322,7 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
      * propagate *identical* replication stream. In this way this replica can
      * advertise the same replication ID as the primary (since it shares the
      * primary replication history and has the same backlog and offsets). */
-    int is_rreplay = (argc > 0 && argv != NULL && argv[0] != NULL && !strcasecmp(objectGetVal(argv[0]), "RREPLAY"));
-    int is_ping = (argc == 1 && argv != NULL && argv[0] != NULL && !strcasecmp(objectGetVal(argv[0]), "PING"));
-    int mm_allowed = (server.active_replica && server.multi_master && (is_rreplay || is_ping));
-    if (server.primary_host != NULL && !mm_allowed) {
-        return;
-    }
+    if (server.primary_host != NULL) return;
 
     /* If there aren't replicas, and there is no backlog buffer to populate,
      * we can return ASAP. */
@@ -3103,11 +3098,16 @@ void syncCommand(client *c) {
         return;
     }
 
+    /* Multi-master nodes have no replicas. They only serve rdb-only snapshots,
+     * which a peer merges into its dataset (MULTIMASTER MERGE). */
+    if (server.multi_master && !c->flag.repl_rdbonly) {
+        addReplyError(c, "Multi-master nodes do not accept replicas, only rdb-only snapshots");
+        return;
+    }
+
     /* Refuse SYNC requests if we are a replica but the link with our primary
-     * is not ok, except in active-replica multi-master mode where peers may
-     * need to synchronize while another upstream link is temporarily down. */
-    if (!(server.active_replica && server.multi_master) && server.primary_host &&
-        server.repl_state != REPL_STATE_CONNECTED) {
+     * is not ok. */
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED) {
         addReplyError(c, "-NOMASTERLINK Can't SYNC while not connected with my master");
         return;
     }
@@ -6940,6 +6940,232 @@ void replicationHandlePrimaryDisconnection(void) {
         connectWithPrimary();
     }
 }
+/* ---------------------- MULTIMASTER MERGE (snapshot fetch) ----------------------
+ * Fetches a peer's snapshot as an rdb-only replica on a separate connection,
+ * downloads it to a temporary file and merges it into the dataset by per-key
+ * HLC (RDBFLAGS_MERGE_HLC). Neither node changes role and the peer links keep
+ * running; writes made on the peer after its snapshot arrive over those links.
+ * capa eof is not sent, so the peer answers with a length-prefixed RDB. SYNC
+ * is only sent once AUTH and REPLCONF are answered: the peer refuses SYNC
+ * while it still has replies pending for the connection. */
+typedef enum {
+    MM_MERGE_IDLE = 0,
+    MM_MERGE_CONNECTING,
+    MM_MERGE_READ_LINE,
+    MM_MERGE_READ_PAYLOAD,
+} mmMergeState;
+
+static struct {
+    mmMergeState state;
+    connection *conn;
+    sds host;
+    int port;
+    sds line;           /* Reply line being read (handshake, keepalives, $<len>). */
+    int pending_ok;     /* +OK replies still expected before SYNC may be sent. */
+    char tmpfile[256];  /* Downloaded snapshot. */
+    int fd;
+    long long expected; /* Snapshot size announced by the peer. */
+    long long received;
+    time_t last_io;
+} mm_merge = {.state = MM_MERGE_IDLE, .fd = -1};
+
+static void mmMergeEnd(int ok, const char *reason) {
+    if (!ok) {
+        serverLog(LL_WARNING, "MULTIMASTER MERGE from %s:%d failed: %s", mm_merge.host ? mm_merge.host : "?",
+                  mm_merge.port, reason);
+    }
+    if (mm_merge.conn) connClose(mm_merge.conn);
+    if (mm_merge.fd != -1) close(mm_merge.fd);
+    if (mm_merge.tmpfile[0]) bg_unlink(mm_merge.tmpfile);
+    sdsfree(mm_merge.host);
+    sdsfree(mm_merge.line);
+    mm_merge.conn = NULL;
+    mm_merge.fd = -1;
+    mm_merge.tmpfile[0] = '\0';
+    mm_merge.host = NULL;
+    mm_merge.line = NULL;
+    mm_merge.state = MM_MERGE_IDLE;
+    server.mm_merge_in_progress = 0;
+    server.mm_merge_last_status = ok ? 1 : 0;
+}
+
+static void mmMergeLoadSnapshot(void) {
+    /* The peer closes an rdb-only link after the transfer; drop ours now. */
+    connClose(mm_merge.conn);
+    mm_merge.conn = NULL;
+    if (fsync(mm_merge.fd) == -1 || close(mm_merge.fd) == -1) {
+        mm_merge.fd = -1;
+        mmMergeEnd(0, "could not write the snapshot file");
+        return;
+    }
+    mm_merge.fd = -1;
+
+    serverLog(LL_NOTICE, "MULTIMASTER MERGE: merging %lld bytes snapshot from %s:%d", mm_merge.received, mm_merge.host,
+              mm_merge.port);
+    rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
+    replicationMergeSnapshotBegin();
+    int ret = rdbLoad(mm_merge.tmpfile, &rsi, RDBFLAGS_MERGE_HLC);
+    if (ret == RDB_OK) server.mm_merge_last_changes = replicationMergeSnapshotFinish(&rsi);
+    rdbFreeSaveInfo(&rsi);
+    mmMergeEnd(ret == RDB_OK, "could not load the snapshot");
+}
+
+/* Handles a complete reply line. Returns 0 when the merge ended. */
+static int mmMergeHandleLine(void) {
+    sds line = mm_merge.line;
+    if (sdslen(line) && line[sdslen(line) - 1] == '\r') sdsrange(line, 0, -2);
+    if (sdslen(line) == 0) return 1; /* Keepalive while the peer prepares the RDB. */
+
+    if (line[0] == '+' && mm_merge.pending_ok > 0) { /* +OK for AUTH and REPLCONF. */
+        sdsclear(line);
+        if (--mm_merge.pending_ok == 0) {
+            sds err = sendCommand(mm_merge.conn, "SYNC", NULL);
+            if (err) {
+                mmMergeEnd(0, err);
+                sdsfree(err);
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (line[0] == '$' && strncmp(line, "$EOF:", 5) != 0) {
+        long long len;
+        if (!string2ll(line + 1, sdslen(line) - 1, &len) || len < 0) {
+            mmMergeEnd(0, "bad snapshot length");
+            return 0;
+        }
+        snprintf(mm_merge.tmpfile, sizeof(mm_merge.tmpfile), "temp-mm-merge-%d.%lld.rdb", (int)getpid(), mstime());
+        mm_merge.fd = open(mm_merge.tmpfile, O_CREAT | O_WRONLY | O_EXCL | O_TRUNC, 0644);
+        if (mm_merge.fd == -1) {
+            mm_merge.tmpfile[0] = '\0';
+            mmMergeEnd(0, strerror(errno));
+            return 0;
+        }
+        mm_merge.expected = len;
+        mm_merge.received = 0;
+        mm_merge.state = MM_MERGE_READ_PAYLOAD;
+        sdsclear(line);
+        if (len == 0) {
+            mmMergeLoadSnapshot();
+            return 0;
+        }
+        return 1;
+    }
+    mmMergeEnd(0, line[0] == '-' ? line : "unexpected reply from peer");
+    return 0;
+}
+
+static void mmMergeReadHandler(connection *conn) {
+    char buf[PROTO_IOBUF_LEN];
+    while (mm_merge.state == MM_MERGE_READ_LINE || mm_merge.state == MM_MERGE_READ_PAYLOAD) {
+        size_t want = 1; /* Lines are short: read them byte by byte so no payload is consumed. */
+        if (mm_merge.state == MM_MERGE_READ_PAYLOAD) {
+            long long left = mm_merge.expected - mm_merge.received;
+            want = left < (long long)sizeof(buf) ? (size_t)left : sizeof(buf);
+        }
+        ssize_t nread = connRead(conn, buf, want);
+        if (nread <= 0) {
+            if (connGetState(conn) == CONN_STATE_CONNECTED) return; /* EAGAIN */
+            mmMergeEnd(0, nread == 0 ? "connection closed by peer" : connGetLastError(conn));
+            return;
+        }
+        mm_merge.last_io = server.unixtime;
+
+        if (mm_merge.state == MM_MERGE_READ_LINE) {
+            if (buf[0] != '\n') {
+                mm_merge.line = sdscatlen(mm_merge.line, buf, 1);
+                if (sdslen(mm_merge.line) > 4096) {
+                    mmMergeEnd(0, "reply line too long");
+                    return;
+                }
+                continue;
+            }
+            if (!mmMergeHandleLine()) return;
+            continue;
+        }
+
+        if (write(mm_merge.fd, buf, nread) != nread) {
+            mmMergeEnd(0, "could not write the snapshot file");
+            return;
+        }
+        mm_merge.received += nread;
+        if (mm_merge.received == mm_merge.expected) {
+            mmMergeLoadSnapshot();
+            return;
+        }
+    }
+}
+
+static void mmMergeConnectHandler(connection *conn) {
+    if (connGetState(conn) != CONN_STATE_CONNECTED) {
+        mmMergeEnd(0, connGetLastError(conn));
+        return;
+    }
+
+    sds err = NULL;
+    if (server.primary_auth) {
+        char *args[3] = {"AUTH", NULL, NULL};
+        size_t lens[3] = {4, 0, 0};
+        int argc = 1;
+        if (server.primary_user) {
+            args[argc] = server.primary_user;
+            lens[argc++] = strlen(server.primary_user);
+        }
+        args[argc] = server.primary_auth;
+        lens[argc++] = sdslen(server.primary_auth);
+        err = sendCommandArgv(conn, argc, args, lens);
+        mm_merge.pending_ok++;
+    }
+    if (err == NULL) err = sendCommand(conn, "REPLCONF", "rdb-only", "1", NULL);
+    mm_merge.pending_ok++;
+    if (err) {
+        mmMergeEnd(0, err);
+        sdsfree(err);
+        return;
+    }
+
+    mm_merge.state = MM_MERGE_READ_LINE;
+    mm_merge.last_io = server.unixtime;
+    connSetReadHandler(conn, mmMergeReadHandler);
+}
+
+static int mmMergeStart(const char *host, int port, const char **err) {
+    if (mm_merge.state != MM_MERGE_IDLE) {
+        *err = "a MULTIMASTER MERGE is already in progress";
+        return C_ERR;
+    }
+    if (upstreamEndpointIsSelf(host, port)) {
+        *err = "cannot merge from this node itself";
+        return C_ERR;
+    }
+    connection *conn = connCreate(connTypeOfReplication());
+    if (conn == NULL) {
+        *err = "could not create a connection";
+        return C_ERR;
+    }
+
+    mm_merge.conn = conn;
+    mm_merge.host = sdsnew(host);
+    mm_merge.port = port;
+    mm_merge.line = sdsempty();
+    mm_merge.pending_ok = 0;
+    mm_merge.state = MM_MERGE_CONNECTING;
+    mm_merge.last_io = server.unixtime;
+    server.mm_merge_in_progress = 1;
+    serverLog(LL_NOTICE, "MULTIMASTER MERGE: fetching snapshot from %s:%d", host, port);
+    if (connConnect(conn, host, port, server.bind_source_addr, server.repl_mptcp, mmMergeConnectHandler) == C_ERR) {
+        mmMergeEnd(0, connGetLastError(conn));
+    }
+    return C_OK;
+}
+
+/* Called from replicationCron(): abort a merge whose peer went silent. */
+static void mmMergeCron(void) {
+    if (mm_merge.state != MM_MERGE_IDLE && server.unixtime - mm_merge.last_io > server.repl_timeout) {
+        mmMergeEnd(0, "timeout");
+    }
+}
+
 /* multimaster command for active active replication */
 void multimasterCommand(client *c) {
     if (server.cluster_enabled) {
@@ -6998,6 +7224,24 @@ void multimasterCommand(client *c) {
                     return;
                 }
             }
+        }
+        addReply(c, shared.ok);
+        return;
+
+    } else if (c->argc == 4 && !strcasecmp(objectGetVal(c->argv[1]), "merge")) {
+        /* MULTIMASTER MERGE host port: merge the peer's snapshot into the
+         * dataset by per-key HLC. Runs in the background; INFO replication
+         * reports progress and the result. */
+        long port;
+        const char *err = NULL;
+        if (!server.multi_master) {
+            addReplyError(c, "MULTIMASTER MERGE requires multi-master yes");
+            return;
+        }
+        if (getRangeLongFromObjectOrReply(c, c->argv[3], 1, 65535, &port, "Invalid peer port") != C_OK) return;
+        if (mmMergeStart(objectGetVal(c->argv[2]), (int)port, &err) != C_OK) {
+            addReplyErrorFormat(c, "%s", err);
+            return;
         }
         addReply(c, shared.ok);
         return;
@@ -7072,6 +7316,11 @@ void replicaofCommand(client *c) {
         return;
     }
 
+    /* Multi-master nodes are peers; primary/replica replication is not used. */
+    if (server.multi_master) {
+        addReplyError(c, "REPLICAOF not allowed in multi-master mode, use MULTIMASTER ADD/REMOVE.");
+        return;
+    }
 
     /* The special host/port combination "NO" "ONE" turns the instance
      * into a primary. Otherwise the new primary address is set. */
@@ -7095,22 +7344,6 @@ void replicaofCommand(client *c) {
         }
 
         if (getRangeLongFromObjectOrReply(c, c->argv[2], 0, 65535, &port, "Invalid master port") != C_OK) return;
-
-        if (server.multi_master) {
-            if (server.primary_host == NULL) {
-                replicationSetPrimary(objectGetVal(c->argv[1]), port, 0, true);
-            } else if (server.primary_host && !strcasecmp(server.primary_host, objectGetVal(c->argv[1])) &&
-                       server.primary_port == port) {
-                serverLog(LL_NOTICE, "REPLICAOF would result into synchronization "
-                                     "with the primary we are already connected "
-                                     "with. No operation performed.");
-                addReplySds(c, sdsnew("+OK Already connected to specified "
-                                      "master\r\n"));
-                return;
-            }
-            addReply(c, shared.ok);
-            return;
-        }
 
         /* Check if we are already attached to the specified primary */
         if (server.primary_host && !strcasecmp(server.primary_host, objectGetVal(c->argv[1])) && server.primary_port == port) {
@@ -7813,6 +8046,7 @@ void replicationCron(void) {
     /* Check failover status first, to see if we need to start
      * handling the failover. */
     updateFailoverStatus();
+    mmMergeCron();
     syncUpstreamRuntimeWithConfigured();
 
     /* Non blocking connection timeout? */

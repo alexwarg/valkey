@@ -87,8 +87,11 @@ start_server {overrides {save {}}} {
         assert {[regexp {replay_backlog=[0-9]+} $m0]}
     }
 
-    test {REPLICAOF NO ONE clears configured upstreams} {
-        $replica replicaof no one
+    test {REPLICAOF is refused and MULTIMASTER REMOVE clears configured upstreams} {
+        assert_error {*REPLICAOF not allowed in multi-master mode*} {$replica replicaof no one}
+        assert_equal 2 [s -2 configured_upstreams]
+
+        $replica multimaster remove
         assert_equal 0 [s -2 configured_upstreams]
         assert_equal 0 [s -2 upstream_runtime_entries]
         assert_equal 0 [s -2 active_upstream_runtime_links]
