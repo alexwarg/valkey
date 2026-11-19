@@ -185,6 +185,14 @@ start_server {tags {"repl external:skip"} overrides {active-replica yes multi-ma
             } else {
                 fail "Peer links were not re-established after node0 restart"
             }
+            # node0's startup merge pulls a snapshot from node1 (a background
+            # save there); let it finish before the next test saves node1.
+            wait_for_condition 100 100 {
+                [s -1 multi_master_merge_pending_peers] == 0
+            } else {
+                fail "node0 startup merge did not finish"
+            }
+            waitForBgsave $node1
         }
 
         test {RDB persists configured upstream metadata} {
@@ -236,6 +244,13 @@ start_server {tags {"repl external:skip"} overrides {active-replica yes multi-ma
         }
 
         test {RDB HLC cap persists newest key clocks first} {
+            # node1's startup merge (previous test) pulls a snapshot from node0.
+            wait_for_condition 100 100 {
+                [s 0 multi_master_merge_pending_peers] == 0
+            } else {
+                fail "node1 startup merge did not finish"
+            }
+            waitForBgsave $node0
             wait_for_condition 100 100 {
                 [s 0 active_upstream_runtime_links] >= 1 &&
                 [s -1 active_upstream_runtime_links] >= 1
