@@ -1559,14 +1559,11 @@ static int rdbSaveInfoEnsureHLCClockMap(rdbSaveInfo *rsi) {
     return rsi->hlc_key_clock != NULL ? C_OK : C_ERR;
 }
 
-/* Save the replication AUX fields (stream db, replication ID and offset),
- * plus multi-master state (MVCC clocks, upstreams, RREPLAY dedupe) that must
- * stay consistent with the replication offset. Also used by forkless sync. */
-int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi) {
-    serverAssert(rsi != NULL);
-    if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
-    if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
-    if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
+/* Multi-master state: HLC clocks, peers, replay queues and RREPLAY dedupe IDs.
+ * Saved with the replication fields, and on its own by multi-master nodes that
+ * have no replication info to save (a primary without a backlog), since a
+ * snapshot merge and a restart both need it. */
+static int rdbSaveMultiMasterAuxFields(rio *rdb) {
     if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-wall", server.hlc_clock.wall_time) == -1) return -1;
     if (rdbSaveAuxFieldStrInt(rdb, "hlc-clock-logical", server.hlc_clock.logical) == -1) return -1;
     unsigned long upstream_count = server.upstreams ? listLength(server.upstreams) : 0;
@@ -1746,6 +1743,17 @@ int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi) {
     return 1;
 }
 
+/* Save the replication AUX fields (stream db, replication ID and offset),
+ * plus multi-master state (MVCC clocks, upstreams, RREPLAY dedupe) that must
+ * stay consistent with the replication offset. Also used by forkless sync. */
+int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi) {
+    serverAssert(rsi != NULL);
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
+    if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
+    return rdbSaveMultiMasterAuxFields(rdb);
+}
+
 /* Save a few default AUX fields with information about the RDB generated. */
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void *) == 8) ? 64 : 32;
@@ -1758,7 +1766,13 @@ int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     if (rdbSaveAuxFieldStrInt(rdb, "used-mem", zmalloc_used_memory()) == -1) return -1;
 
     /* Handle saving options that generate aux fields. */
-    if (rsi && rdbSaveInfoReplAuxFields(rdb, rsi) == -1) return -1;
+    if (rsi) {
+        if (rdbSaveInfoReplAuxFields(rdb, rsi) == -1) return -1;
+    } else if (server.multi_master) {
+        /* A forkless socket save also writes these fields in its tail; the
+         * loader keeps the later copy. */
+        if (rdbSaveMultiMasterAuxFields(rdb) == -1) return -1;
+    }
     if (rdbSaveAuxFieldStrInt(rdb, "aof-base", aof_base) == -1) return -1;
 
     /* Handle additional dynamic aux fields */
@@ -4641,6 +4655,10 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             sdsfree(key);
             decrRefCount(val);
             server.rdb_last_load_keys_expired++;
+        } else if ((rdbflags & RDBFLAGS_MERGE_HLC) && rsi && !replicationMergeSnapshotKey(db, key, val, rsi)) {
+            /* Snapshot merge: the local copy of this key wins. */
+            sdsfree(key);
+            decrRefCount(val);
         } else {
             robj keyobj;
             initStaticStringObject(keyobj, key);
@@ -4649,10 +4667,11 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             int added = dbAddRDBLoad(db, key, &val);
             server.rdb_last_load_keys_loaded++;
             if (!added) {
-                if (rdbflags & RDBFLAGS_ALLOW_DUP) {
+                if (rdbflags & (RDBFLAGS_ALLOW_DUP | RDBFLAGS_MERGE_HLC)) {
                     /* This flag is useful for DEBUG RELOAD special modes.
                      * When it's set we allow new keys to replace the current
-                     * keys with the same name. */
+                     * keys with the same name. A snapshot merge only gets
+                     * here when the snapshot value won. */
                     dbSyncDelete(db, &keyobj);
                     added = dbAddRDBLoad(db, key, &val);
                     serverAssert(added);
