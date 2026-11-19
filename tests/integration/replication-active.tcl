@@ -11,18 +11,17 @@ start_server {tags {"active-repl external:skip"} overrides {save {}}} {
             $n config set replica-read-only no
         }
 
-        $replica replicaof $primary_host $primary_port
+        $replica multimaster add $primary_host $primary_port
         wait_for_condition 100 100 {
-            [s 0 master_link_status] eq {up}
+            [s 0 active_upstream_runtime_links] >= 1 &&
+            [s -1 active_upstream_runtime_links] >= 1
         } else {
             fail "active replica link not established"
         }
 
-        test {Active replicas report role metadata} {
-            set primary_role [$primary role]
-            set replica_role [$replica role]
-            assert_equal master [lindex $primary_role 0]
-            assert_equal active-replica [lindex $replica_role 0]
+        test {Multi-master peers both report the master role} {
+            assert_equal master [lindex [$primary role] 0]
+            assert_equal master [lindex [$replica role] 0]
         }
 
         test {Active replicas propagate writes both directions} {
