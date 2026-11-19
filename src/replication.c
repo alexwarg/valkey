@@ -873,50 +873,6 @@ static int removeConfiguredUpstreamEndpoint(const char *host, int port) {
     return C_OK;
 }
 
-static int selectConfiguredUpstreamAsPrimary(int rotate) {
-    if (server.upstreams == NULL || listLength(server.upstreams) == 0) return C_ERR;
-
-    listNode *current = NULL;
-    listNode *target = NULL;
-    if (server.primary_host != NULL) {
-        current = findConfiguredUpstreamNode(server.primary_host, server.primary_port);
-    }
-
-    if (rotate) {
-        if (current != NULL) {
-            target = listNextNode(current);
-            if (target == NULL) target = listFirst(server.upstreams);
-        } else {
-            target = listFirst(server.upstreams);
-        }
-    } else {
-        target = current ? current : listFirst(server.upstreams);
-    }
-
-    if (target == NULL) return C_ERR;
-    int scan = listLength(server.upstreams);
-    while (scan-- > 0) {
-        valkeyUpstream *candidate = listNodeValue(target);
-        if (candidate && candidate->host && !upstreamEndpointIsSelf(candidate->host, candidate->port)) break;
-        target = listNextNode(target);
-        if (target == NULL) target = listFirst(server.upstreams);
-    }
-    valkeyUpstream *upstream = listNodeValue(target);
-    if (upstream == NULL || upstream->host == NULL || upstreamEndpointIsSelf(upstream->host, upstream->port)) return C_ERR;
-
-    if (server.primary_host != NULL && !strcasecmp(server.primary_host, upstream->host) &&
-        server.primary_port == upstream->port) {
-        recomputeUpstreamRuntimeActiveState();
-        return C_OK;
-    }
-
-    sdsfree(server.primary_host);
-    server.primary_host = sdsnew(upstream->host);
-    server.primary_port = upstream->port;
-    syncUpstreamRuntimeWithConfigured();
-    return C_OK;
-}
-
 static void clearConfiguredUpstreams(void) {
     if (server.upstreams == NULL) return;
 
@@ -1032,6 +988,14 @@ static int decodeRdbUpstreamRuntime(sds encoded, sds *host, int *port, unsigned 
     return C_OK;
 }
 
+/* Restore the multi-master peer set on startup. rsi may be NULL when no RDB
+ * was loaded (no dump file, or AOF in use); the node-local state file is then
+ * the only source.
+ *
+ * Peers are restored as RREPLAY peer links only. They never become the
+ * primary: primary_host is reserved for a real replica-of relationship, so a
+ * multi-master node stays a primary across restarts and can keep its own
+ * replicas. */
 void replicationApplyRdbConfiguredUpstreams(const rdbSaveInfo *rsi) {
     if (server.upstreams == NULL) return;
 
@@ -1040,18 +1004,6 @@ void replicationApplyRdbConfiguredUpstreams(const rdbSaveInfo *rsi) {
      * that snapshot's repl-masters are peer-relative and can collapse the local
      * endpoint set after restart. */
     if (loadConfiguredUpstreamsState() > 0) {
-        int primary_invalid = server.primary_host == NULL ||
-                              upstreamEndpointIsSelf(server.primary_host, server.primary_port) ||
-                              findConfiguredUpstreamNode(server.primary_host, server.primary_port) == NULL;
-        if (server.multi_master && primary_invalid) {
-            if (server.primary_host && upstreamEndpointIsSelf(server.primary_host, server.primary_port)) {
-                sdsfree(server.primary_host);
-                server.primary_host = NULL;
-            }
-            if (selectConfiguredUpstreamAsPrimary(0) == C_OK && server.repl_state == REPL_STATE_NONE) {
-                server.repl_state = REPL_STATE_CONNECT;
-            }
-        }
         syncUpstreamRuntimeWithConfigured();
         return;
     }
@@ -1082,23 +1034,6 @@ void replicationApplyRdbConfiguredUpstreams(const rdbSaveInfo *rsi) {
 
     if (applied == 0 && listLength(server.upstreams) == 0 && server.primary_host != NULL) {
         refreshConfiguredUpstreamsFromPrimary();
-    }
-
-    /* After restart, persisted multi-master upstream endpoints may exist even
-     * when no legacy primary_host was restored. Pick a deterministic upstream
-     * as current primary so replica role/connect logic and RREPLAY forwarding
-     * are re-activated automatically. */
-    int primary_invalid = server.primary_host == NULL ||
-                          upstreamEndpointIsSelf(server.primary_host, server.primary_port) ||
-                          findConfiguredUpstreamNode(server.primary_host, server.primary_port) == NULL;
-    if (applied > 0 && server.multi_master && primary_invalid) {
-        if (server.primary_host && upstreamEndpointIsSelf(server.primary_host, server.primary_port)) {
-            sdsfree(server.primary_host);
-            server.primary_host = NULL;
-        }
-        if (selectConfiguredUpstreamAsPrimary(0) == C_OK && server.repl_state == REPL_STATE_NONE) {
-            server.repl_state = REPL_STATE_CONNECT;
-        }
     }
 
     syncUpstreamRuntimeWithConfigured();
@@ -6698,10 +6633,6 @@ int cancelReplicationHandshake(int reconnect) {
 
     if (!reconnect) return 1;
 
-    if (server.multi_master && listLength(server.upstreams) > 1) {
-        selectConfiguredUpstreamAsPrimary(1);
-    }
-
     /* try to re-connect without waiting for replicationCron, this is needed
      * for the "diskless loading short read" test. */
     if (server.primary_host) {
@@ -6883,9 +6814,6 @@ void replicationHandlePrimaryDisconnection(void) {
     /* Try to re-connect immediately rather than wait for replicationCron
      * waiting 1 second may risk backlog being recycled. */
     if (server.repl_state == REPL_STATE_CONNECT && server.primary_host) {
-        if (server.multi_master && listLength(server.upstreams) > 1) {
-            selectConfiguredUpstreamAsPrimary(1);
-        }
         serverLog(LL_NOTICE, "Reconnecting to PRIMARY %s:%d", server.primary_host, server.primary_port);
         connectWithPrimary();
     }
@@ -7788,10 +7716,6 @@ void replicationCron(void) {
     }
 
     /* Check if we should connect to a PRIMARY */
-    if (server.repl_state == REPL_STATE_CONNECT && server.primary_host == NULL && server.multi_master &&
-        listLength(server.upstreams) > 0) {
-        selectConfiguredUpstreamAsPrimary(0);
-    }
     if (server.repl_state == REPL_STATE_CONNECT && server.primary_host != NULL) {
         serverLog(LL_NOTICE, "Connecting to PRIMARY %s:%d", server.primary_host, server.primary_port);
         connectWithPrimary();
