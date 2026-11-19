@@ -2390,6 +2390,9 @@ struct valkeyServer {
     int active_replica;   /* If enabled, this node may accept writes while being a replica. */
     int multi_master;     /* If enabled, allow multiple configured upstreams (scaffold). */
     int multi_master_no_forward; /* If enabled, avoid forwarding replay traffic (scaffold). */
+    int mm_merge_in_progress;        /* MULTIMASTER MERGE is fetching or loading a peer snapshot. */
+    int mm_merge_last_status;        /* Last MULTIMASTER MERGE: -1 none yet, 0 failed, 1 ok. */
+    long long mm_merge_last_changes; /* Keys changed by the last successful merge. */
     dict *rreplay_seen;   /* Recent replay frames for dedupe. Key: "<origin-uuid>:<replay-id>" */
     list *rreplay_seen_order; /* FIFO order for replay dedupe eviction. Values are sds keys in rreplay_seen. */
     unsigned long long rreplay_seq; /* Local replay sequence generator used for outbound RREPLAY. */
