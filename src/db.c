@@ -1951,6 +1951,8 @@ long long getExpire(serverDb *db, robj *key) {
     return getExpireWithDictIndex(db, key, dict_index);
 }
 
+static void propagateExpiredDeletion(serverDb *db, robj *key, int lazy, int slot);
+
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
     mstime_t expire_latency;
     latencyStartMonitor(expire_latency);
@@ -1960,7 +1962,7 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     latencyTraceIfNeeded(db, expire_del, expire_latency);
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
     signalModifiedKey(NULL, db, keyobj);
-    propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
+    propagateExpiredDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
     server.stat_expiredkeys++;
 }
 
@@ -2003,7 +2005,7 @@ void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
  *    postExecutionUnitOperations, preferably just after a
  *    single deletion batch, so that DEL/UNLINK will NOT be wrapped
  *    in MULTI/EXEC */
-void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
+static void propagateDeletionWithTarget(serverDb *db, robj *key, int lazy, int slot, int target) {
     robj *argv[2];
 
     argv[0] = lazy ? shared.unlink : shared.del;
@@ -2013,8 +2015,18 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
      * Even if module executed a command without asking for propagation. */
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = 1;
-    alsoPropagate(db->id, argv, 2, PROPAGATE_AOF | PROPAGATE_REPL, slot);
+    alsoPropagate(db->id, argv, 2, target, slot);
     server.replication_allowed = prev_replication_allowed;
+}
+
+void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
+    propagateDeletionWithTarget(db, key, lazy, slot, PROPAGATE_AOF | PROPAGATE_REPL);
+}
+
+/* Expiry deletes reach the AOF and replicas but are not forwarded to
+ * multi-master peers, which expire the key themselves (PROPAGATE_NO_RREPLAY). */
+static void propagateExpiredDeletion(serverDb *db, robj *key, int lazy, int slot) {
+    propagateDeletionWithTarget(db, key, lazy, slot, PROPAGATE_AOF | PROPAGATE_REPL | PROPAGATE_NO_RREPLAY);
 }
 
 #define EXPIRE_BULK_LIMIT ((size_t)1024) /* Maximum number of fields to active-expire (per replicated HDEL command */
@@ -2025,7 +2037,7 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
  * for the given hash object `o`. It temporarily enables replication (if needed),
  * constructs the command using the field names, and sends it via alsoPropagate().
  * Returns how many fields where propagated */
-int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx) {
+static int propagateFieldsDeletionWithTarget(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx, int target) {
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = 1;
 
@@ -2041,12 +2053,16 @@ int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields
         argv[argc++] = fields[i];
     }
 
-    alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
+    alsoPropagate(db->id, argv, argc, target, didx);
     server.replication_allowed = prev_replication_allowed;
     for (int i = 0; i < argc; i++) {
         decrRefCount(argv[i]);
     }
     return n_fields;
+}
+
+int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx) {
+    return propagateFieldsDeletionWithTarget(db, o, n_fields, fields, didx, PROPAGATE_AOF | PROPAGATE_REPL);
 }
 
 /* Process expired fields for a hash delete them and propagate changes to replicas and AOF.
@@ -2082,11 +2098,13 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         robj *keyobj = createStringObjectFromSds(objectGetKey(o));
         /* Note that even though if might have been more efficient to only propagate del in case the key has no more items left,
          * we must keep consistency in order to allow the replica to report hdel notifications before del. */
-        propagateFieldsDeletion(db, o, expired, entries, didx);
+        /* Field expiry is local to each multi-master node, like key expiry. */
+        propagateFieldsDeletionWithTarget(db, o, expired, entries, didx,
+                                          PROPAGATE_AOF | PROPAGATE_REPL | PROPAGATE_NO_RREPLAY);
         notifyKeyspaceEvent(NOTIFY_EXPIRED, "hexpired", keyobj, db->id);
         if (deleteKey) {
             dbDelete(db, keyobj);
-            propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
+            propagateExpiredDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
         } else {
             if (!hashTypeHasVolatileFields(o)) dbUntrackKeyWithVolatileItems(db, o);
