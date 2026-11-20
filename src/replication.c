@@ -1566,7 +1566,7 @@ static sds hlcComposeKey(int dbid, robj *keyobj) {
     sds key = sdsnewlen(&dbid_be, sizeof(dbid_be));
     if (keyobj->encoding == OBJ_ENCODING_INT) {
         char llbuf[LONG_STR_SIZE];
-        int len = ll2string(llbuf, sizeof(llbuf), (long long)objectGetVal(keyobj));
+        int len = ll2string(llbuf, sizeof(llbuf), (intptr_t)objectGetVal(keyobj));
         key = sdscatlen(key, llbuf, len);
     } else {
         sds raw = objectGetVal(keyobj);
