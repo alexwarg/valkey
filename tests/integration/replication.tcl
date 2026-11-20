@@ -1766,6 +1766,7 @@ start_server [list tags {"repl external:skip cluster:skip"} overrides [list repl
             "REPLCONF listening-port [srv 0 port]" "+OK" \
             "REPLCONF capa eof capa psync2" "+OK" \
             "REPLCONF version [s valkey_version]" "+OK" \
+            "REPLCONF uuid [s run_id]" "+OK" \
             "PSYNC ? -1" "+CONTINUE" &
         wait_for_condition 50 50 {
             [catch {close [socket "127.0.0.1" $fake_port]}] == 0
