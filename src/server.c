@@ -6753,11 +6753,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "upstream_runtime_replay_fullsync_requests:%llu\r\n", upstream_runtime_replay_fullsync_requests,
                 "hlc_clock_wall:%llu\r\n", (unsigned long long)server.hlc_clock.wall_time,
                 "hlc_clock_logical:%llu\r\n", (unsigned long long)server.hlc_clock.logical,
-                "hlc_key_clock_entries:%lu\r\n", server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0,
-                "hlc_key_tie_break_entries:%lu\r\n", server.hlc_key_tie_break ? dictSize(server.hlc_key_tie_break) : 0,
+                "hlc_key_clock_entries:%zu\r\n", server.hlc_key_clock ? dictSize(server.hlc_key_clock) : 0,
+                "hlc_key_tie_break_entries:%zu\r\n", server.hlc_key_tie_break ? dictSize(server.hlc_key_tie_break) : 0,
                 "hlc_rdb_clock_max_entries:%lld\r\n", server.hlc_rdb_clock_max_entries,
                 "hlc_rdb_clock_entries_dropped_last_save:%llu\r\n", server.hlc_rdb_clock_entries_dropped_last_save,
-                "rreplay_dedupe_entries:%lu\r\n", server.rreplay_seen ? dictSize(server.rreplay_seen) : 0));
+                "rreplay_dedupe_entries:%zu\r\n", server.rreplay_seen ? dictSize(server.rreplay_seen) : 0));
 
         list *info_upstreams =
             (server.upstream_runtime && listLength(server.upstream_runtime) > 0) ? server.upstream_runtime : server.upstreams;
